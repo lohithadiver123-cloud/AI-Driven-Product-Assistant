@@ -1,0 +1,8 @@
+pydantic
+fastapi
+uvicorn[standard]
+motor
+python-jose[cryptography]
+passlib[bcrypt]
+pandas
+rapidfuzz
