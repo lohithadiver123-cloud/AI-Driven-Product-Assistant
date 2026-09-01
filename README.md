@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # AI-Driven Product Assistant based on Customer Feedback with Planning & Requirements Generation Workspace
 
 An intelligent AI Product Manager Copilot designed to ingest, process, categorize, and synthesize customer feedback, support tickets, and feature requests into actionable product requirement documents (PRDs), user stories, and strategic roadmaps.
@@ -174,3 +175,6 @@ python test_auth_complete.py
 # Run Milestone 1 data pipeline tests
 python test_milestone1_complete.py
 ```
+=======
+# AI-Driven-Product-Assistant
+>>>>>>> origin/main
