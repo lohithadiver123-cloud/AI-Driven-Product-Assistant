@@ -1,0 +1,37 @@
+[
+  {
+    "customer_id": "CUST-2001",
+    "source": "AppStore",
+    "type": "review",
+    "text": "FaceID authentication fails intermittently after updating to iOS 17.4.",
+    "created_at": "2026-08-20T10:00:00Z"
+  },
+  {
+    "customer_id": "CUST-2002",
+    "source": "Zendesk",
+    "type": "support_ticket",
+    "text": "Payment gateway rejected our corporate MasterCard with error INVALID_MERCHANT.",
+    "created_at": "2026-08-21T11:30:00Z"
+  },
+  {
+    "customer_id": "CUST-2003",
+    "source": "FeedbackWidget",
+    "type": "feedback",
+    "text": "<div>Would love an integrated <b>Slack bot</b> to alert product managers when new high-priority feedback arrives.</div>",
+    "created_at": "2026-08-22T14:15:00Z"
+  },
+  {
+    "customer_id": "CUST-2004",
+    "source": "Trustpilot",
+    "type": "review",
+    "text": "Awesome software! The AI PRD workspace helped us outline our Q3 roadmap in record time.",
+    "created_at": "2026-08-23T16:00:00Z"
+  },
+  {
+    "customer_id": "CUST-2005",
+    "source": "InApp",
+    "type": "survey",
+    "text": "Page load time for user feedback analytics is over 10 seconds. Highly frustrating.",
+    "created_at": "2026-08-24T09:45:00Z"
+  }
+]

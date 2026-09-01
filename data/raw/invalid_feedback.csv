@@ -1,0 +1,7 @@
+customer_id,source,type,text,created_at
+CUST-3001,Zendesk,support_ticket,"Valid ticket: Cannot login via Okta SSO.",2026-08-25T10:00:00Z
+CUST-3002,AppStore,review,"",2026-08-25T10:05:00Z
+CUST-3003,,survey,"Source is missing but text is present here.",2026-08-25T10:10:00Z
+CUST-3004,Trustpilot,review,"   ",2026-08-25T10:15:00Z
+CUST-3001,Zendesk,support_ticket,"Valid ticket: Cannot login via Okta SSO.",2026-08-25T10:00:00Z
+CUST-3005,InApp,feedback,"Valid feedback: Love the new filter sidebar.",2026-08-25T10:20:00Z
