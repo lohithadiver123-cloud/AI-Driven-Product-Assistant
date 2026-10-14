@@ -65,6 +65,5 @@ HANDOFF.md
 WORKED_SO_FAR.md
 run_demo_verification.py
 
-# Documentation binaries & prototypes
-docs/PM_Copilot_Technical_Documentation.docx
-docs/prototypes/
+# Documentation
+docs/
