@@ -16,7 +16,19 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
 from config import settings
-from services.ai_service import get_gemini_client, get_groq_client, get_mistral_client, _extract_json_from_text, GEMINI_MODELS, GROQ_MODELS, MISTRAL_MODELS
+from services.ai_service import (
+    get_gemini_client,
+    get_groq_client,
+    get_mistral_client,
+    get_openrouter_client,
+    _extract_json_from_text,
+    GEMINI_MODELS,
+    GROQ_MODELS,
+    MISTRAL_MODELS,
+    OPENROUTER_MAX_TOKENS,
+    OPENROUTER_MODELS,
+    OPENROUTER_TIMEOUT_SECONDS,
+)
 import database
 from database import db
 import fallback_db
@@ -163,6 +175,62 @@ async def save_workspace_weights(workspace_id: str, new_weights: Dict[str, float
     return await get_or_create_workspace_weights(workspace_id)
 
 
+# Effort is the one RICE input customer feedback cannot supply. Seeded items carry an
+# explicit placeholder until a person (or engineering) replaces it, and they say so.
+DEFAULT_SEED_EFFORT = 2.0
+
+
+def measured_priority_inputs(count: int, urgency: str) -> Dict[str, Any]:
+    """
+    RICE inputs derived from what the workspace measured.
+
+    Reach is the number of customers the analysis actually attributed to the topic. The
+    earlier version multiplied a sample count by 45-50, which invented the reach and made
+    the RICE score a restatement of volume — a number a reviewer can neither verify nor
+    defend. Impact and confidence are also differentiated from measured volume and severity
+    instead of being pinned at 3.0 and 0.85 for every item in the backlog.
+    """
+    count = max(int(count or 0), 0)
+    urgency = str(urgency or "").lower()
+    if urgency not in ("high", "medium", "low"):
+        urgency = "medium"
+
+    if urgency == "high" and count >= 200:
+        impact = 3.0
+    elif urgency == "high" and count >= 50:
+        impact = 2.0
+    elif urgency == "high":
+        impact = 1.0
+    elif urgency == "medium":
+        impact = 1.0
+    else:
+        impact = 0.5
+
+    if count >= 500:
+        confidence = 0.9
+    elif count >= 200:
+        confidence = 0.85
+    elif count >= 50:
+        confidence = 0.8
+    else:
+        confidence = 0.7
+
+    if urgency == "high" and count >= 100:
+        moscow = "must_have"
+    elif urgency == "high" or count >= 100:
+        moscow = "should_have"
+    else:
+        moscow = "could_have"
+
+    return {
+        "reach": float(count),
+        "impact": impact,
+        "confidence": confidence,
+        "effort": DEFAULT_SEED_EFFORT,
+        "moscow": moscow,
+    }
+
+
 async def auto_seed_prioritization_from_insights(workspace_id: str) -> List[Dict[str, Any]]:
     """
     Auto-seed prioritization items directly from Milestone 2 Feature Clusters and Pain Points.
@@ -190,14 +258,14 @@ async def auto_seed_prioritization_from_insights(workspace_id: str) -> List[Dict
         priority_raw = float(c.get("priority_score", 70.0))
         demand_level = c.get("demand_level", "medium")
 
-        # Estimate parameters
-        reach = float(count * 45)  # Estimate customer reach from sample
-        impact = 3.0 if demand_level == "high" else (2.0 if demand_level == "medium" else 1.0)
-        confidence = 0.85 if count > 20 else 0.70
-        effort = 3.0 if priority_raw > 65 else 2.0
+        inputs = measured_priority_inputs(count, demand_level)
+        reach = inputs["reach"]
+        impact = inputs["impact"]
+        confidence = inputs["confidence"]
+        effort = inputs["effort"]
+        moscow = inputs["moscow"]
         val = round(min(9.5, max(4.0, (priority_raw / 10.0))), 1)
         eff = round(min(8.5, max(2.0, effort * 1.5)), 1)
-        moscow = "must_have" if demand_level == "high" else ("should_have" if demand_level == "medium" else "could_have")
 
         item_doc = {
             "id": f"prio_{uuid.uuid4().hex[:10]}",
@@ -230,10 +298,10 @@ async def auto_seed_prioritization_from_insights(workspace_id: str) -> List[Dict
                 "final_score": 0.0,
             },
             "ai_rationale": (
-                f"Seeded from {count} requests mentioning this topic ({demand_level} demand tier, "
-                f"priority score {priority_raw}). Estimated RICE inputs: reach {reach:.0f}, impact "
-                f"{impact}, confidence {confidence}, effort {effort}; set feasibility and risk to "
-                f"re-rank."
+                f"Measured: {count} requests mention this topic ({demand_level} demand tier). "
+                f"Reach is that count; impact {impact} and confidence {confidence} are derived from "
+                f"volume and demand tier. Assumed until a person sets them: effort {effort:.1f}, "
+                f"feasibility and risk."
             ),
             "feedback_count": count,
             "rank": idx + 1,
@@ -249,13 +317,14 @@ async def auto_seed_prioritization_from_insights(workspace_id: str) -> List[Dict
         impact_raw = float(pp.get("impact_score", 75.0))
         severity = pp.get("severity", "medium")
 
-        reach = float(affected * 50)
-        impact = 3.0 if severity == "high" else (2.0 if severity == "medium" else 1.0)
-        confidence = 0.90
-        effort = 2.0 if severity == "high" else 1.5
+        inputs = measured_priority_inputs(affected, severity)
+        reach = inputs["reach"]
+        impact = inputs["impact"]
+        confidence = inputs["confidence"]
+        effort = inputs["effort"]
+        moscow = inputs["moscow"]
         val = round(min(9.8, max(5.0, (impact_raw / 10.0))), 1)
         eff = round(min(7.0, max(1.5, effort * 1.5)), 1)
-        moscow = "must_have" if severity == "high" else "should_have"
 
         item_doc = {
             "id": f"prio_{uuid.uuid4().hex[:10]}",
@@ -287,9 +356,10 @@ async def auto_seed_prioritization_from_insights(workspace_id: str) -> List[Dict
                 "final_score": 0.0,
             },
             "ai_rationale": (
-                f"Seeded from {affected} reports about this pain point (severity {severity}, impact "
-                f"{impact_raw}/100). Estimated RICE inputs: reach {reach:.0f}, impact {impact}, "
-                f"confidence {confidence}, effort {effort}; set feasibility and risk to re-rank."
+                f"Measured: {affected} reports about this pain point (severity {severity}, "
+                f"impact {impact_raw}/100). Reach is that count; impact {impact} and confidence "
+                f"{confidence} are derived from volume and severity. Assumed until a person sets "
+                f"them: effort {effort:.1f}, feasibility and risk."
             ),
             "feedback_count": affected,
             "rank": len(seeded_items) + 1,
@@ -316,18 +386,77 @@ async def auto_seed_prioritization_from_insights(workspace_id: str) -> List[Dict
     return seeded_items
 
 
+def normalise_prioritization_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Guarantee the fields every consumer of a prioritization item indexes.
+
+    `prioritization_items` has carried two document shapes over its life: an older flat
+    one identified only by `_id` with `title`/`rice_score`, and the canonical one
+    identified by `id` with `name`/`rice{}`. Readers assume the canonical shape, so a
+    single stale row used to take down a whole endpoint with `KeyError: 'id'` — the AI
+    evaluation and roadmap generation both died this way, and the Prioritization table
+    rendered the row with no title and no scores.
+
+    Filling the gaps at the read boundary means a malformed row degrades into an
+    ordinary-looking row instead of a 500 for the entire screen.
+    """
+    if not item.get("id"):
+        item["id"] = str(item.get("_id") or f"prio_{uuid.uuid4().hex[:10]}")
+    if not item.get("name"):
+        item["name"] = item.get("title") or "Untitled initiative"
+    if not item.get("description"):
+        item["description"] = ""
+    if not item.get("category"):
+        item["category"] = "feature_request"
+    if not item.get("moscow"):
+        item["moscow"] = "should_have"
+    if item.get("rank") is None:
+        item["rank"] = 999
+    if item.get("feedback_count") is None:
+        item["feedback_count"] = 0
+
+    # The nested score blocks are read as dictionaries (item.rice.score), so a legacy
+    # flat row would otherwise raise on every render.
+    rice = item.get("rice")
+    if not isinstance(rice, dict):
+        legacy_confidence = float(item.get("confidence") or 0.8)
+        # Legacy rows stored confidence as a percentage (90); the canonical field is a
+        # fraction (0.9). Detect which one we were handed rather than assuming.
+        if legacy_confidence > 1.0:
+            legacy_confidence = legacy_confidence / 100.0
+        rice = {
+            "reach": float(item.get("reach") or 500.0),
+            "impact": float(item.get("impact") or 1.0),
+            "confidence": min(1.0, max(0.1, legacy_confidence)),
+            "effort": float(item.get("effort") or 2.0),
+        }
+    item["rice"] = rice
+    if not isinstance(item.get("value_vs_effort"), dict):
+        item["value_vs_effort"] = {
+            "value": min(10.0, max(1.0, float(item.get("value_effort_score") or 70.0) / 10.0)),
+            "effort": float(item.get("effort") or 2.0),
+        }
+    if not isinstance(item.get("weighted"), dict):
+        item["weighted"] = {}
+
+    return item
+
+
 async def get_prioritization_items(workspace_id: str) -> List[Dict[str, Any]]:
-    """Retrieve all prioritization items for a workspace."""
+    """Retrieve all prioritization items for a workspace, normalised to the canonical shape."""
     if database._mongodb_available:
         cursor = db.prioritization_items.find({"workspace_id": workspace_id}).sort("rank", 1)
         records = await cursor.to_list(length=None)
         for r in records:
             if "_id" in r:
                 r["_id"] = str(r["_id"])
+            normalise_prioritization_item(r)
         return records
     else:
         items = await fallback_db.find_prioritization_items_by_workspace(workspace_id)
-        items.sort(key=lambda x: x.get("rank", 999))
+        for item in items:
+            normalise_prioritization_item(item)
+        items.sort(key=lambda x: x.get("rank") or 999)
         return items
 
 
@@ -419,7 +548,11 @@ async def update_prioritization_item(item_id: str, updates: Dict[str, Any]) -> O
     compute_all_scores_for_item(merged, weights)
 
     if database._mongodb_available:
-        await db.prioritization_items.update_one({"id": item_id}, {"$set": merged})
+        # `existing` comes back from Mongo with `_id` stringified, and `$set` cannot touch
+        # the immutable `_id` field — it raises WriteError code 66 and the whole save fails.
+        # The write path must send the mutable fields only.
+        mutable = {key: value for key, value in merged.items() if key != "_id"}
+        await db.prioritization_items.update_one({"id": item_id}, {"$set": mutable})
         updated = await db.prioritization_items.find_one({"id": item_id})
         if updated and "_id" in updated:
             updated["_id"] = str(updated["_id"])
@@ -452,7 +585,12 @@ async def ai_evaluate_all_priorities(workspace_id: str) -> List[Dict[str, Any]]:
 
     item_summaries = []
     for it in items:
-        item_summaries.append(f"ID: {it['id']} | Name: {it['name']} | Category: {it['category']} | Feedback Count: {it.get('feedback_count', 0)}")
+        # Reached defensively: an un-migrated row must not be able to 500 this endpoint.
+        item_summaries.append(
+            f"ID: {it.get('id')} | Name: {it.get('name') or 'Untitled initiative'} | "
+            f"Category: {it.get('category') or 'feature_request'} | "
+            f"Feedback Count: {it.get('feedback_count', 0)}"
+        )
 
     prompt = f"""You are a Principal Product Operations and Prioritization Specialist.
 Review the following product initiatives derived from user feedback:
@@ -487,30 +625,82 @@ Return ONLY a valid JSON object matching this schema:
 }}
 """
 
-    gem_client = get_gemini_client()
     parsed_evals = None
 
-    if gem_client:
-        for g_model in GEMINI_MODELS:
+    # 1. Attempt Groq AI (Fastest, verified working)
+    groq_client = get_groq_client()
+    if groq_client:
+        for m_name in GROQ_MODELS:
             try:
-                from google.genai import types
-                logger.info(f"Running AI prioritization evaluation with {g_model}...")
-                response = gem_client.models.generate_content(
-                    model=g_model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.2,
-                    ),
+                logger.info(f"Running AI prioritization evaluation with Groq {m_name}...")
+                supports_json = m_name in ["allam-2-7b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+                response = groq_client.chat.completions.create(
+                    model=m_name,
+                    messages=[
+                        {"role": "system", "content": "You are a Principal Product Manager. Respond ONLY in valid JSON."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.2,
+                    max_tokens=2500,
+                    timeout=20,
+                    response_format={"type": "json_object"} if supports_json else None,
                 )
-                parsed = _extract_json_from_text(response.text)
+                parsed = _extract_json_from_text(response.choices[0].message.content)
                 if parsed and "evaluations" in parsed:
                     parsed_evals = parsed["evaluations"]
                     break
             except Exception as e:
-                logger.warning(f"AI prioritization evaluation error on {g_model}: {e}...")
+                logger.warning(f"Groq prioritization error on {m_name}: {e}...")
 
-    # 2. Attempt Mistral AI Fallback (free Experiment tier, OpenAI-compatible)
+    # 2. Attempt OpenRouter Free AI Fallback
+    if not parsed_evals:
+        openrouter_client = get_openrouter_client()
+        if openrouter_client:
+            for m_name in OPENROUTER_MODELS:
+                try:
+                    logger.info(f"Running AI prioritization evaluation with OpenRouter {m_name}...")
+                    response = openrouter_client.chat.completions.create(
+                        model=m_name,
+                        messages=[
+                            {"role": "system", "content": "You are a Principal Product Manager. Respond ONLY in valid JSON."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        temperature=0.2,
+                        max_tokens=OPENROUTER_MAX_TOKENS,
+                        timeout=OPENROUTER_TIMEOUT_SECONDS,
+                    )
+                    parsed = _extract_json_from_text(response.choices[0].message.content)
+                    if parsed and "evaluations" in parsed:
+                        parsed_evals = parsed["evaluations"]
+                        break
+                except Exception as e:
+                    logger.warning(f"OpenRouter prioritization error on {m_name}: {e}...")
+
+    # 3. Attempt Google Gemini Backup
+    if not parsed_evals:
+        gem_client = get_gemini_client()
+        if gem_client:
+            for g_model in GEMINI_MODELS:
+                try:
+                    from google.genai import types
+                    logger.info(f"Running AI prioritization evaluation with {g_model}...")
+                    response = gem_client.models.generate_content(
+                        model=g_model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.2,
+                            timeout=15,
+                        ),
+                    )
+                    parsed = _extract_json_from_text(response.text)
+                    if parsed and "evaluations" in parsed:
+                        parsed_evals = parsed["evaluations"]
+                        break
+                except Exception as e:
+                    logger.warning(f"AI prioritization evaluation error on {g_model}: {e}...")
+
+    # 4. Attempt Mistral AI Fallback (free Experiment tier, OpenAI-compatible)
     if not parsed_evals:
         mistral_client = get_mistral_client()
         if mistral_client:
@@ -526,6 +716,7 @@ Return ONLY a valid JSON object matching this schema:
                         temperature=0.2,
                         max_tokens=2500,
                         response_format={"type": "json_object"},
+                        timeout=20,
                     )
                     parsed = _extract_json_from_text(response.choices[0].message.content)
                     if parsed and "evaluations" in parsed:
@@ -533,31 +724,6 @@ Return ONLY a valid JSON object matching this schema:
                         break
                 except Exception as e:
                     logger.warning(f"Mistral prioritization error on {m_name}: {e}...")
-
-    # 3. Attempt Groq AI Fallback — without this leg, evaluation failed entirely when
-    # Gemini was unreachable, even though Groq carried a valid key.
-    if not parsed_evals:
-        groq_client = get_groq_client()
-        if groq_client:
-            for m_name in GROQ_MODELS:
-                try:
-                    logger.info(f"Running AI prioritization evaluation with Groq {m_name}...")
-                    response = groq_client.chat.completions.create(
-                        model=m_name,
-                        messages=[
-                            {"role": "system", "content": "You are a Principal Product Manager. Respond ONLY in valid JSON."},
-                            {"role": "user", "content": prompt},
-                        ],
-                        temperature=0.2,
-                        max_tokens=2500,
-                        response_format={"type": "json_object"} if m_name in ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"] else None,
-                    )
-                    parsed = _extract_json_from_text(response.choices[0].message.content)
-                    if parsed and "evaluations" in parsed:
-                        parsed_evals = parsed["evaluations"]
-                        break
-                except Exception as e:
-                    logger.warning(f"Groq prioritization error on {m_name}: {e}...")
 
     # Apply updates if evaluations succeeded
     if parsed_evals:

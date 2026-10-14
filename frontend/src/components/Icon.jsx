@@ -25,6 +25,7 @@ const PATHS = {
   arrowRight: <><path d="M4 12h15" /><path d="m13 6 6 6-6 6" /></>,
   chevronRight: <path d="m9 5 7 7-7 7" />,
   chevronDown: <path d="m5 9 7 7 7-7" />,
+  chevronUp: <path d="m19 15-7-7-7 7" />,
   arrowLeft: <><path d="M20 12H5" /><path d="m11 18-6-6 6-6" /></>,
   collapse: <><path d="m6 9 6 6 6-6" /><path d="M4 4h16" /></>,
   table: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M3 10h18" /><path d="M3 15h18" /><path d="M9 10v10" /></>,

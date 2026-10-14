@@ -15,7 +15,6 @@ import {
   Pill,
   Skeleton,
   SkeletonText,
-  WorkspaceSwitcher,
 } from '../components/ui';
 
 const STARTER_PROMPTS = [
@@ -121,6 +120,9 @@ export default function CopilotChat() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [confirmClear, setConfirmClear] = useState(false);
+  const [actionLoading, setActionLoading] = useState({});
+  const [actionDone, setActionDone] = useState({});
+  const [actionNotice, setActionNotice] = useState('');
 
   const bottomRef = useRef(null);
 
@@ -158,8 +160,6 @@ export default function CopilotChat() {
   useEffect(() => {
     if (!workspaceId) return undefined;
     let cancelled = false;
-    setLoading(true);
-    setContext(null);
     Promise.all([loadHistory(workspaceId), loadContext(workspaceId)]).finally(() => {
       if (!cancelled) setLoading(false);
     });
@@ -234,9 +234,62 @@ export default function CopilotChat() {
     }
   };
 
-  const runAction = (action) => {
-    if (action?.action_type === 'create_prd') navigate('/prds');
-    if (action?.action_type === 'generate_stories') navigate('/user-stories');
+  const runAction = async (action, messageId) => {
+    if (!action || !workspaceId) return;
+    const type = action.action_type;
+    const payload = action.payload || {};
+
+    if (type === 'add_to_backlog') {
+      setActionLoading((prev) => ({ ...prev, [messageId]: true }));
+      setError('');
+      try {
+        await api.post('/prioritization/item', {
+          workspace_id: workspaceId,
+          name: payload.name || payload.title || 'New Initiative',
+          description: payload.description || payload.prompt || '',
+          category: payload.category || 'feature_request',
+          reach: Number(payload.reach) || 1000,
+          impact: Number(payload.impact) || 2.0,
+          confidence: Number(payload.confidence) || 0.8,
+          effort: Number(payload.effort) || 2.0,
+          value: Number(payload.value) || 7.5,
+          moscow: payload.moscow || 'should_have',
+        });
+        setActionDone((prev) => ({ ...prev, [messageId]: true }));
+        setActionNotice(`Added “${payload.name || payload.title || 'initiative'}” to your Prioritization Backlog!`);
+      } catch (err) {
+        setError(err?.response?.data?.detail || 'Could not add initiative to backlog.');
+      } finally {
+        setActionLoading((prev) => ({ ...prev, [messageId]: false }));
+      }
+    } else if (type === 'create_prd') {
+      navigate('/prds', {
+        state: {
+          prefill: {
+            title: payload.title || (payload.name ? `PRD: ${payload.name}` : ''),
+            prompt: payload.prompt || payload.description || '',
+            sourceType: payload.pain_point_id ? 'pain_point' : (payload.feature_cluster_id ? 'cluster' : (payload.sourceType === 'feature_cluster' ? 'cluster' : payload.sourceType || 'custom')),
+            painPointId: payload.pain_point_id || '',
+            clusterId: payload.feature_cluster_id || payload.clusterId || '',
+            audience: payload.audience || '',
+            tone: payload.tone || 'comprehensive',
+          },
+        },
+      });
+    } else if (type === 'generate_stories') {
+      navigate('/user-stories', {
+        state: {
+          prefill: {
+            source: payload.prd_id ? 'prd' : (payload.cluster_id ? 'cluster' : 'custom'),
+            prompt: payload.prompt || payload.title || payload.description || '',
+            prdId: payload.prd_id || '',
+            clusterId: payload.cluster_id || '',
+            count: payload.count || 5,
+            persona: payload.persona || 'User',
+          },
+        },
+      });
+    }
   };
 
   // Starter prompts only while the transcript is still basically empty, and
@@ -250,19 +303,22 @@ export default function CopilotChat() {
         title="Copilot"
         description="Grounded in this workspace's own feedback, themes and specs. Every answer cites the records behind it."
         actions={
-          <>
-            <WorkspaceSwitcher />
-            <Button
-              variant="secondary"
-              icon="refresh"
-              disabled={!workspaceId || sending}
-              onClick={() => setConfirmClear(true)}
-            >
-              Clear chat
-            </Button>
-          </>
+          <Button
+            variant="outline"
+            icon="refresh"
+            disabled={!workspaceId || sending}
+            onClick={() => setConfirmClear(true)}
+          >
+            Clear chat
+          </Button>
         }
       />
+
+      {actionNotice && (
+        <Alert variant="success">
+          {actionNotice}
+        </Alert>
+      )}
 
       {error && (
         <Alert variant="error" title="Request failed">
@@ -318,9 +374,28 @@ export default function CopilotChat() {
                       )}
 
                       {m.action && (
-                        <Button size="sm" variant="primary" icon="zap" onClick={() => runAction(m.action)}>
-                          {m.action.label}
-                        </Button>
+                        <div style={{ marginTop: 'var(--sp-2)', display: 'flex', alignItems: 'center', gap: 'var(--sp-2)', flexWrap: 'wrap' }}>
+                          <Button
+                            size="sm"
+                            variant={actionDone[m.id] ? 'outline' : 'primary'}
+                            icon={actionDone[m.id] ? 'check' : (m.action.action_type === 'add_to_backlog' ? 'plus' : 'zap')}
+                            disabled={actionDone[m.id] || actionLoading[m.id]}
+                            loading={actionLoading[m.id]}
+                            onClick={() => runAction(m.action, m.id)}
+                          >
+                            {actionDone[m.id] ? 'Added to Backlog ✓' : (m.action.label || 'Take Action')}
+                          </Button>
+                          {actionDone[m.id] && (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              iconRight="arrowRight"
+                              onClick={() => navigate('/prioritization')}
+                            >
+                              View in Backlog
+                            </Button>
+                          )}
+                        </div>
                       )}
 
                       {m.followups?.length > 0 && (
@@ -424,6 +499,14 @@ export default function CopilotChat() {
                 <li>
                   <span className="context-value">{context.existing_prds?.length ?? 0}</span>
                   <span className="context-name">PRD documents</span>
+                </li>
+                <li>
+                  <span className="context-value">{context.prioritization_items?.length ?? 0}</span>
+                  <span className="context-name">backlog initiatives</span>
+                </li>
+                <li>
+                  <span className="context-value">{context.roadmap_releases?.length ?? 0}</span>
+                  <span className="context-name">roadmap releases</span>
                 </li>
               </ul>
             ) : (

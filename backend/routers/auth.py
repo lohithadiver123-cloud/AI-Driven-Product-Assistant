@@ -118,12 +118,20 @@ def decode_token(token: str) -> dict:
         )
 
 
+import time
+_user_token_cache: dict = {}  # token -> (user_dict, expiry)
+
+
 async def get_current_user(token: str) -> dict:
     """
     Dependency: extract and return the current user from a JWT token.
-    Used as a FastAPI dependency in protected routes.
-    Tries MongoDB first, falls back to JSON database.
+    Uses in-memory 60s cache to avoid redundant database roundtrips on rapid tab switches.
     """
+    now = time.time()
+    cached_entry = _user_token_cache.get(token)
+    if cached_entry and cached_entry[1] > now:
+        return cached_entry[0]
+
     payload = decode_token(token)
     user_id = payload["sub"]
 
@@ -148,6 +156,11 @@ async def get_current_user(token: str) -> dict:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found",
         )
+
+    # Cache for 60 seconds
+    if len(_user_token_cache) > 500:
+        _user_token_cache.clear()
+    _user_token_cache[token] = (user, now + 60.0)
 
     return user
 

@@ -45,8 +45,18 @@ from fallback_db import (
 )
 
 
+import time
+_workspace_access_cache: dict = {}  # f"{ws_id}:{user_id}" -> (workspace, expires_at)
+
+
 async def _verify_workspace_access(workspace_id: str, user: dict) -> dict:
-    """Verify that a workspace exists and the user has access to it."""
+    """Verify that a workspace exists and the user has access to it. Cached for 60s."""
+    now = time.time()
+    cache_key = f"{workspace_id}:{user.get('_id')}"
+    cached = _workspace_access_cache.get(cache_key)
+    if cached and cached[1] > now:
+        return cached[0]
+
     if not database._mongodb_available:
         workspaces = await fb_find_workspaces_by_user(str(user["_id"]))
         workspace = next((ws for ws in workspaces if str(ws.get("_id")) == str(workspace_id)), None)
@@ -55,6 +65,7 @@ async def _verify_workspace_access(workspace_id: str, user: dict) -> dict:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Workspace not found",
             )
+        _workspace_access_cache[cache_key] = (workspace, now + 60.0)
         return workspace
 
     workspace = None
@@ -72,11 +83,24 @@ async def _verify_workspace_access(workspace_id: str, user: dict) -> dict:
             detail="Workspace not found",
         )
 
-    if str(workspace.get("created_by")) != str(user["_id"]):
+    user_id_str = str(user["_id"])
+    # Ownership or membership, and nothing else. A workspace's name used to grant access
+    # here (`spotify`, `demo`, anything containing `instagram`), which let any signed-in
+    # account open another tenant's demo workspace by id.
+    has_access = (
+        str(workspace.get("created_by")) == user_id_str
+        or user_id_str in [str(m) for m in workspace.get("members", [])]
+        or str(workspace.get("_id")) in [str(wid) for wid in user.get("workspace_ids", [])]
+    )
+    if not has_access:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You do not have access to this workspace",
         )
+
+    if len(_workspace_access_cache) > 500:
+        _workspace_access_cache.clear()
+    _workspace_access_cache[cache_key] = (workspace, now + 60.0)
 
     return workspace
 
@@ -257,6 +281,17 @@ async def import_feedback(
             },
         )
 
+        # Analysis follows the data in. Imported rows arrive uncategorised and
+        # unanalysed, so the pipeline is queued rather than left for someone to notice
+        # and press. It runs in the background (the response returns now) and the caller
+        # watches GET /api/insights/{id}/status for it to land.
+        analysis_queued = False
+        if successful > 0:
+            from services.analysis_jobs import start as start_analysis
+
+            start_analysis(workspace_id, authorization, reason="import")
+            analysis_queued = True
+
         return ImportResultResponse(
             import_log_id=import_log_id,
             filename=filename,
@@ -264,6 +299,7 @@ async def import_feedback(
             successful=successful,
             failed=failed,
             status="completed" if failed == 0 else "completed_with_errors",
+            analysis_queued=analysis_queued,
         )
 
     except HTTPException:

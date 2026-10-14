@@ -224,7 +224,7 @@ class Milestone2Validation(unittest.TestCase):
             self.assertNotEqual(status["provider"], "None")
             self.assertTrue(status["model"])
             for name in status["provider"].split(" + "):
-                self.assertIn(name, ["Gemini", "Mistral", "Groq"])
+                self.assertIn(name, ["Gemini", "Mistral", "Groq", "OpenRouter"])
         else:
             self.assertEqual(status["provider"], "None")
 

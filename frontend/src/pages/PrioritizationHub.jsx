@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import api from '../services/api';
 import Icon from '../components/Icon';
 import { useBusy } from '../context/BusyContext';
@@ -22,7 +23,6 @@ import {
   Tabs,
   Textarea,
   Toolbar,
-  WorkspaceSwitcher,
 } from '../components/ui';
 
 const FRAMEWORKS = [
@@ -72,22 +72,28 @@ const IMPACT_OPTIONS = [
  * Prioritization — decide what to build next.
  *
  * Four frameworks over the same initiative list, so they share one toolbar,
- * one tab pattern and one table. The page's primary action is adding an
- * initiative; the two generation actions sit in the toolbar as secondary.
+ * one tab pattern and one table. The page's one filled button is the next step
+ * in the flow — the roadmap; adding, seeding and calibrating are the working
+ * strip below it.
  */
 export default function PrioritizationHub() {
   const { begin } = useBusy();
+  const navigate = useNavigate();
 
   const { activeId: workspaceId, ready } = useWorkspaces();
-  const [items, setItems] = useState([]);
-  const [weights, setWeights] = useState({
-    customer_demand_weight: 0.35,
-    business_impact_weight: 0.3,
-    feasibility_weight: 0.2,
-    risk_mitigation_weight: 0.15,
+  const [items, setItems] = useState(() => (workspaceId ? api.getCached(`/prioritization/workspace/${workspaceId}`) || [] : []));
+  const [weights, setWeights] = useState(() => {
+    const cached = workspaceId ? api.getCached(`/prioritization/workspace/${workspaceId}/weights`) : null;
+    return {
+      customer_demand_weight: 0.35,
+      business_impact_weight: 0.3,
+      feasibility_weight: 0.2,
+      risk_mitigation_weight: 0.15,
+      ...(cached || {}),
+    };
   });
 
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => !workspaceId || !api.getCached(`/prioritization/workspace/${workspaceId}`));
   const [busyAction, setBusyAction] = useState('');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -108,7 +114,9 @@ export default function PrioritizationHub() {
 
   const loadData = useCallback(async (id) => {
     if (!id) return;
-    setLoading(true);
+    if (!api.getCached(`/prioritization/workspace/${id}`)) {
+      setLoading(true);
+    }
     setError('');
     try {
       const [itemsResult, weightsResult] = await Promise.all([
@@ -279,14 +287,12 @@ export default function PrioritizationHub() {
       <PageHeader
         icon="scale"
         title="Prioritization"
-        description="Rank the same initiative list four ways — RICE, value against effort, MoSCoW, and your own weighted model."
+        trail="prioritized"
+        description="Rank one initiative list four ways — RICE, value against effort, MoSCoW or your own weights."
         actions={
-          <>
-            <WorkspaceSwitcher />
-            <Button variant="primary" icon="plus" disabled={!workspaceId} onClick={() => setShowAdd(true)}>
-              Add initiative
-            </Button>
-          </>
+          <Button variant="primary" icon="arrowRight" disabled={!items.length} onClick={() => navigate('/roadmap')}>
+            Plan releases
+          </Button>
         }
       />
 
@@ -296,6 +302,9 @@ export default function PrioritizationHub() {
       <Toolbar
         left={
           <>
+            <Button variant="outline" icon="plus" disabled={!workspaceId} onClick={() => setShowAdd(true)}>
+              Add initiative
+            </Button>
             <Button
               variant="outline"
               icon="refresh"

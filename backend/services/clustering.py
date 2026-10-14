@@ -22,6 +22,7 @@ from services.text_mining import (
     group_keywords,
     label_group,
     record_text,
+    stable_topic_id,
 )
 from services.theme_extraction import _resolve_sentiment
 
@@ -93,20 +94,30 @@ def count_unique_requesters(items: List[Dict[str, Any]], has_identity: Optional[
 
 
 def _select_feature_items(feedback_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Keep feedback that actually asks for a change."""
+    """Keep feedback that actually asks for a change, filtering out pure bug reports."""
+    categorized_features = [
+        item for item in feedback_list
+        if item.get("category") == "feature_request"
+    ]
+    if len(categorized_features) >= 5:
+        return categorized_features
+
     feature_items = [
         item for item in feedback_list
-        if any(marker in record_text(item) for marker in REQUEST_MARKERS)
+        if item.get("category") != "bug_report"
+        and any(marker in record_text(item) for marker in REQUEST_MARKERS)
     ]
 
     if len(feature_items) < 2:
         feature_items = [
             item for item in feedback_list
-            if any(keyword in record_text(item) for keyword in FEATURE_INTENT_KEYWORDS)
+            if item.get("category") != "bug_report"
+            and any(keyword in record_text(item) for keyword in FEATURE_INTENT_KEYWORDS)
         ]
     if not feature_items:
         feature_items = feedback_list[: max(3, len(feedback_list) // 4)]
     return feature_items
+
 
 
 # --------------------------------------------------------------------------
@@ -224,8 +235,11 @@ def cluster_feature_requests(feedback_list: List[Dict[str, Any]], max_clusters: 
             },
         })
 
+    # Stable ids, as in the pain-point and theme engines: a rank-based id changes on the
+    # next analysis and breaks every document and prioritization item that linked to it.
     clusters.sort(key=lambda cluster: cluster["priority_score"], reverse=True)
     clusters = clusters[:max_clusters]
     for rank, cluster in enumerate(clusters, start=1):
-        cluster["id"] = f"cluster_{rank}"
+        cluster["id"] = stable_topic_id("cluster", cluster.get("cluster_name", ""), cluster.get("keywords"))
+        cluster["rank"] = rank
     return clusters

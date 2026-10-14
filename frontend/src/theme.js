@@ -12,8 +12,8 @@
  */
 
 export const palette = {
-  accent: '#4f46e5',
-  accentStrong: '#4338ca',
+  accent: '#1e3a8a',
+  accentStrong: '#172554',
   ink: '#18181b',
   muted: '#71717a',
   line: '#e4e4e7',

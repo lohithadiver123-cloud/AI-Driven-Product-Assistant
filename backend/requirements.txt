@@ -26,6 +26,11 @@ nltk==3.9.1
 # CORS support
 python-dotenv==1.0.1
 
+# Lead AI provider (the code imports `google.genai`, which only the google-genai
+# package provides — it was missing from this list, so a fresh install left the
+# first-choice provider unable to initialise and silently fell through to Groq)
+google-genai>=1.0.0
+
 # Groq AI & CrewAI Multi-Agent System (Milestone 2)
 groq>=0.9.0
 crewai>=0.80.0

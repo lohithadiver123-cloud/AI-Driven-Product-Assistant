@@ -8,10 +8,11 @@ domain vocabulary belongs in this file, because every analysis surface must work
 for any workspace a user imports.
 """
 
+import hashlib
 import re
 from collections import Counter, defaultdict
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from services.preprocessing import STOPWORDS_SET
 
@@ -37,6 +38,12 @@ INTENT_AND_OPINION_WORDS = {
     "everything", "anything", "something", "nothing", "everybody", "anybody",
     "hopefully", "hope", "seem", "seems", "felt", "feel", "feels", "looking",
     "look", "looks", "become", "kinda", "sorta", "maybe", "probably",
+    "sharing", "reaches", "share", "team", "rather", "report", "reporting",
+    "walk", "away", "full", "day", "days", "streets", "street", "recording",
+    "counts", "count", "writing", "write", "fresh", "curious", "roadmap",
+    "explain", "instance", "instances", "worth", "story", "rough", "flagging",
+    "flag", "deciding", "posting", "post", "waited", "waiting", "whole",
+    "happily", "happy", "sure", "decide",
 }
 
 # Generic phrasing that signals an enhancement idea rather than a plain statement.
@@ -52,9 +59,10 @@ REQUEST_MARKERS = [
     "want ", "wants ", "wish", "hope", "would like", "would love", "could you",
     "can you", "can we", "allow ", "let us", "bring back", "restore", "fix ",
     "improve", "support for", "remove ", "option to", "option for", "ability to",
-    "missing", "lack ", "lack of", "why can", "when will", "introduce", "make it",
+    "missing feature", "missing option", "lack ", "lack of", "why can", "when will", "introduce", "make it",
     "give us", "no way to", "not able to", "unable to",
 ]
+
 
 # Tokens that read better upper-cased inside a generated label.
 ACRONYMS = {"pdf", "csv", "ui", "ux", "api", "ios", "sms", "faq", "kpi", "2fa", "mfa"}
@@ -372,6 +380,89 @@ def match_records_by_terms(items: List[Dict[str, Any]], terms: List[str]) -> Lis
     if not patterns:
         return []
     return [item for item in items if any(pattern.search(record_text(item)) for pattern in patterns)]
+
+
+def stable_topic_id(prefix: str, label: str, terms: Optional[Iterable[str]] = None) -> str:
+    """
+    A topic id derived from the topic itself rather than its rank.
+
+    Rank-based ids (`pain_point_1`, `ai_cluster_3`) are renumbered whenever the analysis
+    is re-run, so every document, prioritization item and roadmap entry that referenced
+    one silently starts pointing at a different topic. Hashing the label's own words
+    keeps an id stable for as long as the topic is described the same way.
+    """
+    words: Set[str] = set()
+    for token in content_tokens(label):
+        words.add(token_stem(token))
+    for term in terms or []:
+        for token in content_tokens(str(term)):
+            words.add(token_stem(token))
+    basis = " ".join(sorted(words)) or str(label or "topic").lower()
+    return f"{prefix}_{hashlib.sha1(basis.encode('utf-8')).hexdigest()[:10]}"
+
+
+def term_mention_share(term: str, items: List[Dict[str, Any]]) -> float:
+    """Share of records that mention a term at all, as a whole word."""
+    if not items:
+        return 0.0
+    return len(match_records_by_terms(items, [term])) / len(items)
+
+
+def distinctive_terms(
+    terms: Iterable[Any],
+    items: List[Dict[str, Any]],
+    max_share: float = 0.2,
+    min_items: int = CORPUS_WIDE_SHARE_MIN_ITEMS,
+) -> List[str]:
+    """
+    Keep only the terms that actually pick a subset of the corpus out.
+
+    A word mentioned across most of a corpus describes the corpus itself — in a music
+    app, "music", "song" and "spotify" match nearly everything, so a topic defined by
+    them is not a topic, and grouping on them makes several "different" issues match the
+    same complaints. Terms that match nothing here are dropped for the same reason.
+    """
+    kept: List[str] = []
+    for term in terms:
+        cleaned = " ".join(str(term or "").lower().split())
+        if len(cleaned) <= 2 or cleaned in kept:
+            continue
+        share = term_mention_share(cleaned, items)
+        if share <= 0.0:
+            continue
+        if len(items) >= min_items and share > max_share:
+            continue
+        kept.append(cleaned)
+    return kept
+
+
+def absorb_overlapping_groups(
+    groups: List[Tuple[str, Set[Any]]],
+    containment: float = 0.6,
+) -> Tuple[List[Tuple[str, Set[Any]]], List[Tuple[str, str]]]:
+    """
+    Collapse groups that describe the same records, most important group first.
+
+    Input groups are ordered by importance. A group whose members are mostly already
+    covered by a kept group is an alias of it, not a second issue — reporting both
+    counts the same customers twice, which is how one complaint became four "separate"
+    pain points in an earlier analysis.
+
+    Returns (kept groups, [(absorbed label, kept label), ...]).
+    """
+    kept: List[Tuple[str, Set[Any]]] = []
+    absorbed: List[Tuple[str, str]] = []
+    for label, members in groups:
+        member_set = {member for member in members if member is not None}
+        if not member_set:
+            continue
+        for kept_label, kept_members in kept:
+            if len(member_set & kept_members) / len(member_set) >= containment:
+                absorbed.append((label, kept_label))
+                break
+        else:
+            kept.append((label, member_set))
+    return kept, absorbed
 
 
 def request_phrases(items: List[Dict[str, Any]], limit: int = 6) -> List[str]:

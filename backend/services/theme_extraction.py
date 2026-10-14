@@ -19,6 +19,7 @@ from services.text_mining import (
     group_keywords,
     label_group,
     record_text,
+    stable_topic_id,
     titleize,
     top_phrases,
 )
@@ -215,6 +216,57 @@ def _issue_candidates(feedback_list: List[Dict[str, Any]]) -> List[Dict[str, Any
     return candidates
 
 
+def measured_group_score(items: List[Dict[str, Any]], total_count: int) -> Dict[str, Any]:
+    """
+    Score a set of records from measurement alone.
+
+    Volume (35) + rating penalty (25) + negative share (25) + bug share (15), clamped to
+    20-98. Shared by the mined pain points and the AI-grounded ones so a model's own
+    impact number can never outrank a measured one.
+    """
+    count = len(items)
+    if count == 0:
+        return {
+            "count": 0,
+            "avg_rating": None,
+            "negative_count": 0,
+            "negative_pct": 0.0,
+            "bug_count": 0,
+            "impact_score": 20.0,
+            "severity": "low",
+        }
+
+    safe_total = max(int(total_count), 1)
+    ratings = [item.get("rating") for item in items if item.get("rating") is not None]
+    avg_rating = round(sum(ratings) / len(ratings), 1) if ratings else 2.0
+    negative_count = sum(1 for item in items if _resolve_sentiment(item) == "negative")
+    negative_pct = round((negative_count / count) * 100, 1)
+    bug_count = sum(1 for item in items if _resolve_category(item) in ("bug_report", "performance_issue"))
+
+    vol_factor = min(35.0, (count / safe_total) * 100.0 * 2.0)
+    rating_penalty = max(0.0, (5.0 - avg_rating) * 5.0)
+    neg_factor = (negative_count / count) * 25.0
+    bug_factor = (bug_count / count) * 15.0
+    impact_score = round(min(98.0, max(20.0, vol_factor + rating_penalty + neg_factor + bug_factor)), 1)
+
+    if impact_score >= 60.0 or count >= 10 or (avg_rating <= 1.5 and negative_count > 5):
+        severity = "high"
+    elif impact_score >= 40.0 or count >= 3:
+        severity = "medium"
+    else:
+        severity = "low"
+
+    return {
+        "count": count,
+        "avg_rating": avg_rating,
+        "negative_count": negative_count,
+        "negative_pct": negative_pct,
+        "bug_count": bug_count,
+        "impact_score": impact_score,
+        "severity": severity,
+    }
+
+
 def extract_pain_points_from_feedback(
     feedback_list: List[Dict[str, Any]],
     max_pain_points: int = 10,
@@ -264,26 +316,13 @@ def extract_pain_points_from_feedback(
         )
         used_labels.add(title.lower())
 
-        ratings = [it.get("rating") for it in items if it.get("rating") is not None]
-        avg_rating = round(sum(ratings) / len(ratings), 1) if ratings else 2.0
-        neg_count = sum(1 for it in items if _resolve_sentiment(it) == "negative")
-        negative_pct = round((neg_count / count) * 100, 1)
-        bug_count = sum(1 for it in items if _resolve_category(it) in ("bug_report", "performance_issue"))
-
-        # Deterministic impact formula (0-100):
-        # volume (35) + rating penalty (25) + negative share (25) + bug share (15)
-        vol_factor = min(35.0, (count / total_count) * 100.0 * 2.0)
-        rating_penalty = max(0.0, (5.0 - avg_rating) * 5.0)
-        neg_factor = (neg_count / count) * 25.0
-        bug_factor = (bug_count / count) * 15.0
-        impact_score = round(min(98.0, max(20.0, vol_factor + rating_penalty + neg_factor + bug_factor)), 1)
-
-        if impact_score >= 60.0 or count >= 10 or (avg_rating <= 1.5 and neg_count > 5):
-            severity = "high"
-        elif impact_score >= 40.0 or count >= 3:
-            severity = "medium"
-        else:
-            severity = "low"
+        measured = measured_group_score(items, total_count)
+        avg_rating = measured["avg_rating"]
+        neg_count = measured["negative_count"]
+        negative_pct = measured["negative_pct"]
+        bug_count = measured["bug_count"]
+        impact_score = measured["impact_score"]
+        severity = measured["severity"]
 
         terms = ", ".join(group_keywords(
             title, phrase_freq, corpus_freq, surface_index, len(issue_candidates), max_share=PAIN_POINT_MAX_SHARE
@@ -323,12 +362,14 @@ def extract_pain_points_from_feedback(
             },
         })
 
-    # Rank-stable ids: pain_point_1 is always the highest-impact pain point. The PRD,
-    # user-story and prioritisation services ground documents on these ids.
+    # Ids are derived from the topic itself, not its rank. A rank-based id is renumbered
+    # on every re-analysis, which silently repoints every PRD, user story, prioritization
+    # item and roadmap entry that referenced it. `rank` still carries the ordering.
     pain_points.sort(key=lambda x: x["impact_score"], reverse=True)
     pain_points = pain_points[:max_pain_points]
     for rank, pain_point in enumerate(pain_points, start=1):
-        pain_point["id"] = f"pain_point_{rank}"
+        pain_point["id"] = stable_topic_id("pain_point", pain_point.get("title", ""), pain_point.get("keywords"))
+        pain_point["rank"] = rank
     return pain_points
 
 

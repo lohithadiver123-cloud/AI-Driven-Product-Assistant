@@ -15,7 +15,6 @@ import {
   Select,
   SkeletonTable,
   Toolbar,
-  WorkspaceSwitcher,
 } from '../components/ui';
 
 const CATEGORIES = [
@@ -61,9 +60,10 @@ export default function FeedbackList() {
   const { begin } = useBusy();
 
   const { activeId: selectedWorkspace, ready } = useWorkspaces();
-  const [items, setItems] = useState([]);
-  const [total, setTotal] = useState(0);
-  const [totalPages, setTotalPages] = useState(1);
+  const cachedInitial = selectedWorkspace ? api.getCached('/feedback', { workspace_id: selectedWorkspace, page: 1, limit: 20 }) : null;
+  const [items, setItems] = useState(() => cachedInitial?.items || []);
+  const [total, setTotal] = useState(() => cachedInitial?.total || 0);
+  const [totalPages, setTotalPages] = useState(() => cachedInitial?.total_pages || 1);
   const [page, setPage] = useState(1);
   const [limit] = useState(20);
 
@@ -71,14 +71,21 @@ export default function FeedbackList() {
   const [sentiment, setSentiment] = useState('');
   const [source, setSource] = useState('');
 
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => !selectedWorkspace || !cachedInitial);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState(null);
   const [busyAction, setBusyAction] = useState('');
 
   const fetchFeedback = useCallback(async () => {
     if (!selectedWorkspace) return;
-    setLoading(true);
+    const params = { workspace_id: selectedWorkspace, page, limit };
+    if (category) params.category = category;
+    if (sentiment) params.sentiment = sentiment;
+    if (source) params.source = source;
+
+    if (!api.getCached('/feedback', params)) {
+      setLoading(true);
+    }
     setError('');
     try {
       const params = { workspace_id: selectedWorkspace, page, limit };
@@ -140,6 +147,7 @@ export default function FeedbackList() {
       <PageHeader
         icon="inbox"
         title="Feedback"
+        trail="insight"
         description="Every imported record. Clean the text, then categorise to unlock themes and sentiment."
         actions={
           <>
@@ -171,8 +179,6 @@ export default function FeedbackList() {
       <Toolbar
         left={
           <>
-            <WorkspaceSwitcher layout="stacked" onChange={() => setPage(1)} />
-
             <Select label="Category" value={category} onChange={resetTo(setCategory)}>
               {CATEGORIES.map((c) => (
                 <option key={c.value} value={c.value}>

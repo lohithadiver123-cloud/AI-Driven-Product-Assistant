@@ -11,6 +11,7 @@ import {
 } from '../components/Charts';
 import { useBusy } from '../context/BusyContext';
 import { useWorkspaces } from '../context/WorkspaceContext';
+import useAnalysisStatus from '../hooks/useAnalysisStatus';
 import {
   Alert,
   Badge,
@@ -20,10 +21,12 @@ import {
   CardHeader,
   EmptyState,
   ErrorState,
-  IconButton,
+  Hint,
   Input,
+  Menu,
   Modal,
   PageHeader,
+  ProgressBar,
   Select,
   SkeletonCardGrid,
   SkeletonChart,
@@ -31,7 +34,6 @@ import {
   Stat,
   StatGrid,
   Tabs,
-  WorkspaceSwitcher,
 } from '../components/ui';
 
 const TABS = [
@@ -73,12 +75,14 @@ export default function InsightsDashboard() {
   const { begin } = useBusy();
 
   const { activeId: selectedWorkspace, ready } = useWorkspaces();
-  const [insights, setInsights] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const [insights, setInsights] = useState(() => (selectedWorkspace ? api.getCached(`/insights/${selectedWorkspace}`) : null));
+  const [loading, setLoading] = useState(() => !selectedWorkspace || !api.getCached(`/insights/${selectedWorkspace}`));
   const [running, setRunning] = useState('');
   const [error, setError] = useState('');
   const [activeTab, setActiveTab] = useState('pain-points');
   const [severityFilter, setSeverityFilter] = useState('all');
+  const [showAllPainPoints, setShowAllPainPoints] = useState(false);
+  const [showAllClusters, setShowAllClusters] = useState(false);
 
   const [aiStatus, setAiStatus] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -89,8 +93,10 @@ export default function InsightsDashboard() {
 
   const fetchInsights = useCallback(async (workspaceId) => {
     if (!workspaceId) return;
-    setLoading(true);
     setError('');
+    if (!api.getCached(`/insights/${workspaceId}`)) {
+      setLoading(true);
+    }
     try {
       const { data } = await api.get(`/insights/${workspaceId}`);
       setInsights(data);
@@ -105,6 +111,20 @@ export default function InsightsDashboard() {
       setLoading(false);
     }
   }, []);
+
+  // Analysis runs on the server. The page asks what it is doing, reports it, and picks
+  // the result up the moment it lands instead of holding a request open for a minute.
+  const { status: analysis, run: runJob } = useAnalysisStatus(
+    selectedWorkspace,
+    async (finalStatus) => {
+      if (finalStatus.state === 'failed') {
+        setError(finalStatus.error || 'Analysis failed. Try again in a moment.');
+        return;
+      }
+      setNotice('Analysis finished — the numbers below are up to date.');
+      await fetchInsights(selectedWorkspace);
+    }
+  );
 
   // The workspace list itself lives in the provider; only the optional AI
   // engine status is fetched here.
@@ -134,11 +154,16 @@ export default function InsightsDashboard() {
     setError('');
     setNotice('');
     try {
-      const { data } = await api.post(path);
+      const data = await runJob(path);
       if (data?.agents_executed) {
+        // The agent crew answers with its own result instead of queueing a job.
         setNotice(`Analysis finished across ${data.agents_executed.length} agents: ${data.agents_executed.join(', ')}.`);
+        await fetchInsights(selectedWorkspace);
+      } else if (data?.state === 'failed') {
+        setError(data.error || `${label} failed. Try again in a moment.`);
       }
-      await fetchInsights(selectedWorkspace);
+      // Otherwise it is queued: the banner reports progress and the watcher re-fetches
+      // the insights when the run finishes.
     } catch (err) {
       setError(err.response?.data?.detail || `${label} failed. Try again in a moment.`);
     } finally {
@@ -170,55 +195,79 @@ export default function InsightsDashboard() {
       <PageHeader
         icon="barChart"
         title="Insights"
-        description="Themes, pain points, feature demand and sentiment trends extracted from this workspace's feedback."
+        trail="insight"
+        description="Themes, pain points and feature demand mined from this workspace's feedback."
         actions={
           <>
-            <IconButton
-              icon="sliders"
-              label="AI engine settings"
-              onClick={() => {
-                setKeyMessage('');
-                setShowSettings(true);
-              }}
+            <Menu
+              label="Analysis options"
+              items={[
+                {
+                  label: hasData ? 'Re-run analysis' : 'Run analysis',
+                  icon: 'zap',
+                  disabled: !selectedWorkspace,
+                  onSelect: () => runAnalysis(`/insights/${selectedWorkspace}/analyze`, 'Extracting insights'),
+                },
+                {
+                  label: 'Run agent crew',
+                  icon: 'users',
+                  disabled: !selectedWorkspace,
+                  onSelect: () =>
+                    runAnalysis(`/insights/${selectedWorkspace}/crew-ai-analyze`, 'Running the agent crew'),
+                },
+                {
+                  label: 'AI engine settings',
+                  icon: 'sliders',
+                  onSelect: () => {
+                    setKeyMessage('');
+                    setShowSettings(true);
+                  },
+                },
+              ]}
             />
-            <Button
-              variant="outline"
-              icon="users"
-              disabled={!selectedWorkspace}
-              loading={running.endsWith('crew-ai-analyze')}
-              onClick={() => runAnalysis(`/insights/${selectedWorkspace}/crew-ai-analyze`, 'Running the agent crew')}
-            >
-              Run agent crew
-            </Button>
+
             <Button
               variant="primary"
-              icon="zap"
-              disabled={!selectedWorkspace}
-              loading={running.endsWith('/analyze')}
-              onClick={() => runAnalysis(`/insights/${selectedWorkspace}/analyze`, 'Extracting insights')}
+              icon="target"
+              disabled={!hasData}
+              onClick={() => navigate('/prioritization')}
             >
-              {hasData ? 'Re-run analysis' : 'Run analysis'}
+              Prioritize these
             </Button>
           </>
         }
       />
 
+      {insights?.analyzed_at && (
+        <div className="meta-line">
+          Analysed{' '}
+          {new Date(insights.analyzed_at).toLocaleDateString(undefined, {
+            month: 'short',
+            day: 'numeric',
+            year: 'numeric',
+          })}
+          <Hint label="How this analysis was produced">
+            {insights.ai_powered
+              ? `Written by ${insights.ai_model || 'an AI model'} from this workspace's records, then scored deterministically.`
+              : 'Mined deterministically from this workspace’s records — no model involved.'}
+          </Hint>
+        </div>
+      )}
+
       {notice && <Alert variant="success">{notice}</Alert>}
       {error && <Alert variant="error">{error}</Alert>}
 
-      <Card>
-        <CardBody>
-          <div className="row row-wrap row-between">
-            <WorkspaceSwitcher layout="stacked" />
-
-            <span className="text-sm text-muted">
-              {insights?.analyzed_at
-                ? `Last analysed ${new Date(insights.analyzed_at).toLocaleString()}`
-                : 'Not analysed yet'}
+      {analysis?.state === 'running' && (
+        <Alert variant="info" title="Analysing this workspace">
+          <div className="stack stack-sm">
+            <span className="text-sm">
+              {analysis.stage_label || 'Working'}
+              {analysis.progress ? ` · ${analysis.progress}%` : ''}
             </span>
+            <ProgressBar value={analysis.progress ?? null} label={analysis.stage_label || 'Analysis progress'} />
           </div>
-        </CardBody>
-      </Card>
+        </Alert>
+      )}
 
       {loading ? (
         <>
@@ -273,30 +322,20 @@ export default function InsightsDashboard() {
             <Stat label="Feature clusters" value={clusters.length} hint="Grouped opportunity areas" />
           </StatGrid>
 
-          {/* Say plainly which engine produced this analysis, so a review can tell
-              model output apart from figures mined out of the workspace itself. */}
-          <div className="callout stack stack-xs">
-            <strong className="text-sm">
-              {insights.ai_powered ? 'AI-assisted analysis' : 'Analysis mode: deterministic engine'}
-            </strong>
-            <span className="text-xs text-muted">
-              {insights.ai_powered
-                ? `Themes, pain points and clusters were reviewed by ${insights.ai_model || 'an AI model'}. Every count, rating and quote below still comes from the records in this workspace.`
-                : 'No AI provider was reachable, so themes, pain points and clusters were mined from the wording of your own feedback. Every count, rating and quote below is computed from your records — nothing is estimated or invented.'}
-            </span>
-          </div>
-
           {insights.ai_summary && (
-            <Card>
-              <CardHeader title={`Executive summary — ${insights.ai_summary.headline}`} />
-              <CardBody className="stack stack-md">
-                <p className="prose">{insights.ai_summary.overview}</p>
+            <Card className="compact-summary-card">
+              <CardHeader
+                title={`Executive summary — ${insights.ai_summary.headline}`}
+                hint="A written read of the numbers on this page, grounded in workspace records."
+              />
+              <CardBody className="stack stack-sm" style={{ padding: 'var(--sp-3) var(--sp-4)' }}>
+                <p className="prose text-sm" style={{ margin: 0 }}>{insights.ai_summary.overview}</p>
 
                 <div className="grid grid-2">
                   {insights.ai_summary.top_frictions?.length > 0 && (
-                    <div className="callout callout-warning stack stack-sm">
-                      <strong>Where customers get stuck</strong>
-                      <ul className="styled-list">
+                    <div className="callout callout-warning stack stack-xs" style={{ padding: 'var(--sp-2) var(--sp-3)' }}>
+                      <strong className="text-xs">Where customers get stuck</strong>
+                      <ul className="styled-list text-xs" style={{ margin: 0 }}>
                         {insights.ai_summary.top_frictions.map((item) => (
                           <li key={item}>{item}</li>
                         ))}
@@ -304,9 +343,9 @@ export default function InsightsDashboard() {
                     </div>
                   )}
                   {insights.ai_summary.quick_wins?.length > 0 && (
-                    <div className="callout stack stack-sm" style={{ background: 'var(--success-light)', borderColor: 'var(--success-line)' }}>
-                      <strong>Cheapest wins</strong>
-                      <ul className="styled-list">
+                    <div className="callout stack stack-xs" style={{ background: 'var(--success-light)', borderColor: 'var(--success-line)', padding: 'var(--sp-2) var(--sp-3)' }}>
+                      <strong className="text-xs">Cheapest wins</strong>
+                      <ul className="styled-list text-xs" style={{ margin: 0 }}>
                         {insights.ai_summary.quick_wins.map((item) => (
                           <li key={item}>{item}</li>
                         ))}
@@ -361,76 +400,122 @@ export default function InsightsDashboard() {
                   </EmptyState>
                 </Card>
               ) : (
-                <div className="insights-grid">
-                  {filteredPainPoints.map((pp) => (
-                    <Card key={pp.id} className={`severity-${pp.severity}`}>
-                      <CardBody className="stack stack-md">
-                        <div className="insight-card-header">
-                          <div className="stack stack-sm">
-                            <Badge tone={SEVERITY_TONE[pp.severity] || 'neutral'}>{pp.severity}</Badge>
-                            <h3 className="insight-card-title">{pp.title}</h3>
-                          </div>
-                          <span className="impact-pill">
-                            <strong>{pp.impact_score}</strong>/100
-                          </span>
-                        </div>
-
-                        <p className="insight-card-desc">{pp.description}</p>
-
-                        {pp.score_breakdown && (
-                          <div className="callout text-xs text-muted stack stack-sm">
-                            <strong className="text-sm">How this score was reached</strong>
-                            <div>
-                              {pp.score_breakdown.frequency} items · {pp.score_breakdown.negative_sentiment_pct}%
-                              negative · avg rating {pp.score_breakdown.avg_rating} ·{' '}
-                              {pp.score_breakdown.bug_count} bugs
+                <div className="stack stack-md">
+                  <div className="insights-grid">
+                    {(showAllPainPoints ? filteredPainPoints : filteredPainPoints.slice(0, 3)).map((pp, idx) => (
+                      <Card key={pp.id} className={`severity-${pp.severity}`}>
+                        <CardBody className="stack stack-sm" style={{ padding: 'var(--sp-3)' }}>
+                          <div className="insight-card-header">
+                            <div className="stack stack-xs">
+                              <div className="row" style={{ gap: 'var(--sp-2)' }}>
+                                <span className={`rank-pill rank-${idx + 1}`}>#{idx + 1}</span>
+                                <Badge tone={SEVERITY_TONE[pp.severity] || 'neutral'} className="badge-sm">{pp.severity}</Badge>
+                              </div>
+                              <h3 className="insight-card-title">{pp.title}</h3>
                             </div>
+                            <span className="impact-pill">
+                              <strong>{pp.impact_score}</strong>/100
+                            </span>
                           </div>
-                        )}
 
-                        {pp.root_cause && (
-                          <div className="ai-note-box">
-                            <strong>Likely root cause: </strong>
-                            {pp.root_cause}
+                          <p className="insight-card-desc">{pp.description}</p>
+
+                          {pp.score_breakdown && (
+                            <details className="text-xs text-muted" style={{ cursor: 'pointer' }}>
+                              <summary style={{ fontWeight: 500, color: 'var(--text-muted)' }}>
+                                Scoring details · {pp.affected_users_count || pp.score_breakdown.frequency} items
+                              </summary>
+                              <div className="callout text-xs text-muted stack stack-sm" style={{ marginTop: 'var(--sp-1)' }}>
+                                <div>
+                                  {pp.score_breakdown.frequency} items · {pp.score_breakdown.negative_sentiment_pct}%
+                                  negative · avg rating {pp.score_breakdown.avg_rating} ·{' '}
+                                  {pp.score_breakdown.bug_count} bugs
+                                </div>
+                              </div>
+                            </details>
+                          )}
+
+                          {pp.root_cause && (
+                            <div className="ai-note-box">
+                              <strong>Likely root cause: </strong>
+                              {pp.root_cause}
+                            </div>
+                          )}
+
+                          {pp.recommended_action && (
+                            <div className="recommendation-box">
+                              <strong>Recommended action: </strong>
+                              {pp.recommended_action}
+                            </div>
+                          )}
+
+                          {pp.sample_quotes?.length > 0 && (
+                            <div className="quotes-section">
+                              <span className="quotes-title">In their words</span>
+                              {pp.sample_quotes.map((quote) => (
+                                <blockquote key={quote} className="quote-bubble">
+                                  “{quote}”
+                                </blockquote>
+                              ))}
+                            </div>
+                          )}
+
+                          <div className="insight-card-footer">
+                            <span>
+                              {pp.category?.replace(/_/g, ' ')} · {pp.affected_users_count} items
+                            </span>
                           </div>
-                        )}
 
-                        {pp.recommended_action && (
-                          <div className="recommendation-box">
-                            <strong>Recommended action: </strong>
-                            {pp.recommended_action}
+                          <div className="row" style={{ gap: 'var(--sp-2)', marginTop: 'var(--sp-1)' }}>
+                            <Button
+                              variant="primary"
+                              size="sm"
+                              icon="file"
+                              className="flex-1"
+                              onClick={() =>
+                                navigate('/prds', {
+                                  state: {
+                                    prefill: {
+                                      sourceType: 'pain_point',
+                                      painPointId: pp.id,
+                                      title: `Resolve: ${pp.title}`,
+                                      prompt: pp.description || pp.recommended_action || '',
+                                    },
+                                  },
+                                })
+                              }
+                            >
+                              Convert to PRD
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              icon="calendar"
+                              onClick={() => navigate('/roadmap', { state: { highlight: pp.title } })}
+                              title="Add to Roadmap"
+                            >
+                              Roadmap
+                            </Button>
                           </div>
-                        )}
+                        </CardBody>
+                      </Card>
+                    ))}
+                  </div>
 
-                        {pp.sample_quotes?.length > 0 && (
-                          <div className="quotes-section">
-                            <span className="quotes-title">In their words</span>
-                            {pp.sample_quotes.map((quote) => (
-                              <blockquote key={quote} className="quote-bubble">
-                                “{quote}”
-                              </blockquote>
-                            ))}
-                          </div>
-                        )}
-
-                        <div className="insight-card-footer">
-                          <span>
-                            {pp.category?.replace(/_/g, ' ')} · {pp.affected_users_count} items
-                          </span>
-                        </div>
-
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          icon="file"
-                          fullWidth
-                          onClick={() => navigate('/prds')}
-                        >
-                          Draft a PRD from this
-                        </Button>
-                      </CardBody>
-                    </Card>
-                  ))}
+                  {filteredPainPoints.length > 3 && (
+                    <div style={{ textAlign: 'center', paddingTop: 'var(--sp-2)' }}>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        icon={showAllPainPoints ? 'chevronUp' : 'chevronDown'}
+                        onClick={() => setShowAllPainPoints((v) => !v)}
+                      >
+                        {showAllPainPoints
+                          ? 'Show top 3 pain points only'
+                          : `Show all ${filteredPainPoints.length} pain points (+${filteredPainPoints.length - 3} more)`}
+                      </Button>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -461,77 +546,123 @@ export default function InsightsDashboard() {
               </Card>
 
               {clusters.length > 0 && (
-                <div className="insights-grid">
-                  {clusters.map((cluster) => (
-                    <Card key={cluster.id}>
-                      <CardBody className="stack stack-md">
-                        <div className="cluster-card-header">
-                          <div className="stack stack-sm">
-                            <Badge tone={DEMAND_TONE[cluster.demand_level] || 'neutral'}>
-                              {cluster.demand_level} demand
-                            </Badge>
-                            <h3 className="cluster-title">{cluster.cluster_name}</h3>
+                <div className="stack stack-md">
+                  <div className="insights-grid">
+                    {(showAllClusters ? clusters : clusters.slice(0, 3)).map((cluster, idx) => (
+                      <Card key={cluster.id}>
+                        <CardBody className="stack stack-sm" style={{ padding: 'var(--sp-3)' }}>
+                          <div className="cluster-card-header">
+                            <div className="stack stack-xs">
+                              <div className="row" style={{ gap: 'var(--sp-2)' }}>
+                                <span className={`rank-pill rank-${idx + 1}`}>#{idx + 1}</span>
+                                <Badge tone={DEMAND_TONE[cluster.demand_level] || 'neutral'} className="badge-sm">
+                                  {cluster.demand_level} demand
+                                </Badge>
+                              </div>
+                              <h3 className="cluster-title">{cluster.cluster_name}</h3>
+                            </div>
+                            <div className="priority-meter">
+                              <span className="priority-score">{cluster.priority_score}</span>
+                              <span className="priority-label">Score</span>
+                            </div>
                           </div>
-                          <div className="priority-meter">
-                            <span className="priority-score">{cluster.priority_score}</span>
-                            <span className="priority-label">Score</span>
-                          </div>
-                        </div>
 
-                        <p className="cluster-summary">{cluster.summary}</p>
+                          <p className="cluster-summary">{cluster.summary}</p>
 
-                        {cluster.score_breakdown?.formula_weights && (
-                          <div className="callout text-xs text-muted">
-                            <strong className="text-sm">Scoring weights: </strong>
-                            {cluster.score_breakdown.formula_weights}
-                          </div>
-                        )}
+                          {cluster.score_breakdown?.formula_weights && (
+                            <details className="text-xs text-muted" style={{ cursor: 'pointer' }}>
+                              <summary style={{ fontWeight: 500, color: 'var(--text-muted)' }}>
+                                Scoring weights
+                              </summary>
+                              <div className="callout text-xs text-muted" style={{ marginTop: 'var(--sp-1)' }}>
+                                <strong className="text-sm">Scoring weights: </strong>
+                                {cluster.score_breakdown.formula_weights}
+                              </div>
+                            </details>
+                          )}
 
-                        {cluster.keywords?.length > 0 && (
-                          <div className="keyword-tags">
-                            {cluster.keywords.map((keyword) => (
-                              <span key={keyword} className="keyword-pill">
-                                {keyword}
+                          {cluster.keywords?.length > 0 && (
+                            <div className="keyword-tags">
+                              {cluster.keywords.map((keyword) => (
+                                <span key={keyword} className="keyword-pill">
+                                  {keyword}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+
+                          {cluster.sample_requests?.length > 0 && (
+                            <div className="quotes-section">
+                              <span className="quotes-title">
+                                {cluster.request_count} requests
+                                {cluster.score_breakdown?.unique_customers_count_basis === 'unique_customers'
+                                  ? ` from ${cluster.unique_customers_count} customers`
+                                  : ''}
                               </span>
-                            ))}
-                          </div>
-                        )}
+                              {cluster.sample_requests.map((request) => (
+                                <blockquote key={request} className="quote-bubble">
+                                  “{request}”
+                                </blockquote>
+                              ))}
+                            </div>
+                          )}
 
-                        {cluster.sample_requests?.length > 0 && (
-                          <div className="quotes-section">
-                            <span className="quotes-title">
-                              {cluster.request_count} requests
-                              {cluster.score_breakdown?.unique_customers_count_basis === 'unique_customers'
-                                ? ` from ${cluster.unique_customers_count} customers`
-                                : ''}
-                            </span>
-                            {cluster.sample_requests.map((request) => (
-                              <blockquote key={request} className="quote-bubble">
-                                “{request}”
-                              </blockquote>
-                            ))}
+                          <div className="cluster-footer">
+                            <span>{cluster.request_count} requests</span>
+                            <div className="progress" style={{ width: 80 }}>
+                              <span className="progress-fill" style={{ width: `${cluster.priority_score}%` }} />
+                            </div>
                           </div>
-                        )}
 
-                        <div className="cluster-footer">
-                          <span>{cluster.request_count} requests</span>
-                          <div className="progress" style={{ width: 80 }}>
-                            <span className="progress-fill" style={{ width: `${cluster.priority_score}%` }} />
+                          <div className="row" style={{ gap: 'var(--sp-2)', marginTop: 'var(--sp-1)' }}>
+                            <Button
+                              variant="primary"
+                              size="sm"
+                              icon="target"
+                              className="flex-1"
+                              onClick={() => navigate('/prioritization')}
+                            >
+                              Prioritize
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              icon="file"
+                              onClick={() =>
+                                navigate('/prds', {
+                                  state: {
+                                    prefill: {
+                                      sourceType: 'cluster',
+                                      clusterId: cluster.id,
+                                      title: `Build: ${cluster.cluster_name}`,
+                                      prompt: cluster.summary || '',
+                                    },
+                                  },
+                                })
+                              }
+                            >
+                              Convert to PRD
+                            </Button>
                           </div>
-                        </div>
+                        </CardBody>
+                      </Card>
+                    ))}
+                  </div>
 
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          icon="file"
-                          fullWidth
-                          onClick={() => navigate('/prds')}
-                        >
-                          Draft a PRD from this
-                        </Button>
-                      </CardBody>
-                    </Card>
-                  ))}
+                  {clusters.length > 3 && (
+                    <div style={{ textAlign: 'center', paddingTop: 'var(--sp-2)' }}>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        icon={showAllClusters ? 'chevronUp' : 'chevronDown'}
+                        onClick={() => setShowAllClusters((v) => !v)}
+                      >
+                        {showAllClusters
+                          ? 'Show top 3 opportunities only'
+                          : `Show all ${clusters.length} opportunities (+${clusters.length - 3} more)`}
+                      </Button>
+                    </div>
+                  )}
                 </div>
               )}
             </div>

@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import api from '../services/api';
 import { useBusy } from '../context/BusyContext';
 import { useWorkspaces } from '../context/WorkspaceContext';
+import useAnalysisStatus from '../hooks/useAnalysisStatus';
 import {
   Alert,
   Badge,
@@ -11,9 +13,9 @@ import {
   CardHeader,
   EmptyState,
   PageHeader,
+  ProgressBar,
   Select,
   SkeletonTable,
-  WorkspaceSwitcher,
 } from '../components/ui';
 
 const SOURCE_OPTIONS = [
@@ -37,15 +39,17 @@ const STATUS_TONE = { completed: 'success', failed: 'danger', pending: 'warning'
  */
 export default function ImportData() {
   const { begin } = useBusy();
+  const navigate = useNavigate();
   const fileInputRef = useRef(null);
 
-  const { activeId: selectedWorkspace, ready } = useWorkspaces();
+  const { activeId: selectedWorkspace, activeWorkspace, ready } = useWorkspaces();
   const [source, setSource] = useState('app_review');
   const [file, setFile] = useState(null);
   const [dragging, setDragging] = useState(false);
   const [importing, setImporting] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
+  const [analysisError, setAnalysisError] = useState('');
 
   const [logs, setLogs] = useState([]);
   const [loadingLogs, setLoadingLogs] = useState(true);
@@ -84,6 +88,20 @@ export default function ImportData() {
     setError('');
   };
 
+  // An import queues its own analysis, so this page reports that run rather than
+  // leaving someone to guess whether anything is happening to the rows they just added.
+  const { status: analysis, refresh: refreshAnalysis } = useAnalysisStatus(
+    selectedWorkspace,
+    async (finalStatus) => {
+      if (finalStatus.state === 'failed') {
+        setAnalysisError(finalStatus.error || 'The analysis failed. Run it again from Insights.');
+        return;
+      }
+      setAnalysisError('');
+      await fetchLogs(selectedWorkspace);
+    }
+  );
+
   const handleImport = async () => {
     if (!file) {
       setError('Choose a file to import first.');
@@ -113,6 +131,10 @@ export default function ImportData() {
       setFile(null);
       if (fileInputRef.current) fileInputRef.current.value = '';
       await fetchLogs(selectedWorkspace);
+      if (data.analysis_queued) {
+        // Pick up the run the import just started.
+        await refreshAnalysis();
+      }
     } catch (err) {
       setError(err.response?.data?.detail || 'The import failed. Nothing was written — try again.');
     } finally {
@@ -165,12 +187,14 @@ export default function ImportData() {
           </label>
 
           <div className="form-row">
+            {/* Where this lands is whatever workspace the top bar is on, so it
+                is stated rather than offered twice. */}
             <div className="form-group form-group-half">
-              <WorkspaceSwitcher
-                label="Destination workspace"
-                layout="stacked"
-                disabled={importing}
-              />
+              <span className="field-label">Destination</span>
+              <p className="destination-note">
+                {activeWorkspace?.name || 'No workspace selected'}
+                <span className="text-muted text-xs">Change it from the workspace menu in the top bar.</span>
+              </p>
             </div>
 
             <div className="form-group form-group-half">
@@ -212,6 +236,34 @@ export default function ImportData() {
               </div>
             </Alert>
           )}
+
+          {result?.analysis_queued && analysis?.state === 'running' && (
+            <Alert variant="info" title="Analysing the rows you just imported">
+              <div className="stack stack-sm">
+                <span className="text-sm">
+                  {analysis.stage_label || 'Working'}
+                  {analysis.progress ? ` · ${analysis.progress}%` : ''}
+                </span>
+                <ProgressBar value={analysis.progress ?? null} label={analysis.stage_label || 'Analysis progress'} />
+                <span className="text-xs text-muted">
+                  This keeps running if you leave this page.
+                </span>
+              </div>
+            </Alert>
+          )}
+
+          {result?.analysis_queued && analysis?.state === 'completed' && (
+            <Alert variant="success" title="Analysis complete">
+              <div className="row row-wrap" style={{ gap: 'var(--sp-4)', alignItems: 'center' }}>
+                <span>Themes, pain points and clusters are ready.</span>
+                <Button variant="outline" size="sm" icon="barChart" onClick={() => navigate('/insights')}>
+                  View insights
+                </Button>
+              </div>
+            </Alert>
+          )}
+
+          {analysisError && <Alert variant="error">{analysisError}</Alert>}
         </CardBody>
       </Card>
 

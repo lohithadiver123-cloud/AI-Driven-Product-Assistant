@@ -25,23 +25,31 @@ export default function WorkspaceSwitcher({
   className = '',
   onChange,
 }) {
-  const { workspaces, activeId, activeWorkspace, loading, ready, setActive } = useWorkspaces();
+  const { workspaces, activeId, activeWorkspace, loading, ready, setActive, createWorkspace } = useWorkspaces();
   const [open, setOpen] = useState(false);
+  const [isCreating, setIsCreating] = useState(false);
+  const [newName, setNewName] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [createError, setCreateError] = useState('');
   const rootRef = useRef(null);
   const triggerRef = useRef(null);
+  const inputRef = useRef(null);
   const generatedId = useId();
   const triggerId = id || generatedId;
   const listId = `${triggerId}-list`;
 
   const close = () => {
     setOpen(false);
+    setIsCreating(false);
+    setNewName('');
+    setCreateError('');
     triggerRef.current?.focus();
   };
 
   useEffect(() => {
     if (!open) return undefined;
     const onPointerDown = (event) => {
-      if (rootRef.current && !rootRef.current.contains(event.target)) setOpen(false);
+      if (rootRef.current && !rootRef.current.contains(event.target)) close();
     };
     const onKeyDown = (event) => {
       if (event.key === 'Escape') close();
@@ -62,6 +70,26 @@ export default function WorkspaceSwitcher({
     setActive(nextId);
     onChange?.(nextId);
     close();
+  };
+
+  const handleCreate = async (e) => {
+    e?.preventDefault();
+    const trimmed = newName.trim();
+    if (!trimmed) return;
+    setSubmitting(true);
+    setCreateError('');
+    try {
+      const created = await createWorkspace(trimmed);
+      setIsCreating(false);
+      setNewName('');
+      setOpen(false);
+      const newId = created?._id || created?.id;
+      if (newId) onChange?.(newId);
+    } catch (err) {
+      setCreateError(err?.response?.data?.detail || 'Failed to create workspace');
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   const currentName = loading
@@ -95,7 +123,16 @@ export default function WorkspaceSwitcher({
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={open ? listId : undefined}
-        onClick={() => setOpen((value) => !value)}
+        onClick={() => {
+          setOpen((value) => {
+            if (!value) {
+              setIsCreating(false);
+              setNewName('');
+              setCreateError('');
+            }
+            return !value;
+          });
+        }}
       >
         <span className="ws-trigger-dot" aria-hidden="true" />
         <span className="ws-trigger-name">{currentName}</span>
@@ -105,14 +142,85 @@ export default function WorkspaceSwitcher({
       {open && (
         <div className="ws-menu" role="listbox" id={listId} aria-label={label || 'Workspaces'}>
           <div className="ws-menu-head">
-            <span>Workspaces</span>
-            <span className="ws-menu-count">{workspaces.length}</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <span>Workspaces</span>
+              <span className="ws-menu-count">{workspaces.length}</span>
+            </div>
+            {!isCreating && (
+              <button
+                type="button"
+                className="ws-head-create-btn"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setIsCreating(true);
+                  setCreateError('');
+                  setTimeout(() => inputRef.current?.focus(), 60);
+                }}
+              >
+                <Icon name="plus" size={12} />
+                <span>New</span>
+              </button>
+            )}
           </div>
+
+          {isCreating && (
+            <div className="ws-top-form-wrap">
+              <form
+                className="ws-create-form"
+                onSubmit={handleCreate}
+                onClick={(e) => e.stopPropagation()}
+              >
+                <input
+                  ref={inputRef}
+                  type="text"
+                  className="ws-create-input"
+                  placeholder="Workspace name..."
+                  value={newName}
+                  onChange={(e) => {
+                    setNewName(e.target.value);
+                    if (createError) setCreateError('');
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Escape') {
+                      setIsCreating(false);
+                      setNewName('');
+                      setCreateError('');
+                    }
+                  }}
+                  disabled={submitting}
+                  maxLength={60}
+                  autoFocus
+                />
+                {createError && <p className="ws-create-error">{createError}</p>}
+                <div className="ws-create-actions">
+                  <button
+                    type="button"
+                    className="ws-btn-ghost"
+                    disabled={submitting}
+                    onClick={() => {
+                      setIsCreating(false);
+                      setNewName('');
+                      setCreateError('');
+                    }}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    className="ws-btn-primary"
+                    disabled={submitting || !newName.trim()}
+                  >
+                    {submitting ? 'Creating…' : 'Create'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          )}
 
           <div className="ws-menu-list">
             {workspaces.length === 0 && (
               <p className="ws-menu-empty">
-                {ready ? 'No workspaces yet. Create one from the Dashboard.' : 'Loading workspaces…'}
+                {ready ? 'No workspaces yet. Create your first one above.' : 'Loading workspaces…'}
               </p>
             )}
             {workspaces.map((workspace) => {
@@ -137,6 +245,23 @@ export default function WorkspaceSwitcher({
               );
             })}
           </div>
+
+          {!isCreating && (
+            <div className="ws-menu-actions">
+              <button
+                type="button"
+                className="ws-new-btn"
+                onClick={() => {
+                  setIsCreating(true);
+                  setCreateError('');
+                  setTimeout(() => inputRef.current?.focus(), 60);
+                }}
+              >
+                <Icon name="plus" size={13} />
+                <span>New workspace</span>
+              </button>
+            </div>
+          )}
 
           <p className="ws-menu-foot">Switching here updates every page.</p>
         </div>

@@ -52,6 +52,8 @@ export default function FloatingCopilot() {
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
+  const [actionLoading, setActionLoading] = useState({});
+  const [actionDone, setActionDone] = useState({});
 
   // Read from the provider rather than localStorage so the thread follows a
   // workspace switch made on the page underneath.
@@ -88,12 +90,71 @@ export default function FloatingCopilot() {
           sender: 'assistant',
           text: data.reply,
           sources: data.sources_cited || [],
+          action: data.action_suggested,
         },
       ]);
     } catch {
       setError('No answer came back. The API may be offline.');
     } finally {
       setSending(false);
+    }
+  };
+
+  const runAction = async (action, messageId) => {
+    if (!action || !workspaceId) return;
+    const type = action.action_type;
+    const payload = action.payload || {};
+
+    if (type === 'add_to_backlog') {
+      setActionLoading((prev) => ({ ...prev, [messageId]: true }));
+      try {
+        await api.post('/prioritization/item', {
+          workspace_id: workspaceId,
+          name: payload.name || payload.title || 'New Initiative',
+          description: payload.description || payload.prompt || '',
+          category: payload.category || 'feature_request',
+          reach: Number(payload.reach) || 1000,
+          impact: Number(payload.impact) || 2.0,
+          confidence: Number(payload.confidence) || 0.8,
+          effort: Number(payload.effort) || 2.0,
+          value: Number(payload.value) || 7.5,
+          moscow: payload.moscow || 'should_have',
+        });
+        setActionDone((prev) => ({ ...prev, [messageId]: true }));
+      } catch (err) {
+        setError(err?.response?.data?.detail || 'Could not add initiative.');
+      } finally {
+        setActionLoading((prev) => ({ ...prev, [messageId]: false }));
+      }
+    } else if (type === 'create_prd') {
+      setOpen(false);
+      navigate('/prds', {
+        state: {
+          prefill: {
+            title: payload.title || (payload.name ? `PRD: ${payload.name}` : ''),
+            prompt: payload.prompt || payload.description || '',
+            sourceType: payload.pain_point_id ? 'pain_point' : (payload.feature_cluster_id ? 'cluster' : (payload.sourceType === 'feature_cluster' ? 'cluster' : payload.sourceType || 'custom')),
+            painPointId: payload.pain_point_id || '',
+            clusterId: payload.feature_cluster_id || payload.clusterId || '',
+            audience: payload.audience || '',
+            tone: payload.tone || 'comprehensive',
+          },
+        },
+      });
+    } else if (type === 'generate_stories') {
+      setOpen(false);
+      navigate('/user-stories', {
+        state: {
+          prefill: {
+            source: payload.prd_id ? 'prd' : (payload.cluster_id ? 'cluster' : 'custom'),
+            prompt: payload.prompt || payload.title || payload.description || '',
+            prdId: payload.prd_id || '',
+            clusterId: payload.cluster_id || '',
+            count: payload.count || 5,
+            persona: payload.persona || 'User',
+          },
+        },
+      });
     }
   };
 
@@ -152,6 +213,20 @@ export default function FloatingCopilot() {
             <div key={m.id} className={['chat-row', m.sender === 'user' && 'is-user'].filter(Boolean).join(' ')}>
               <div className={['chat-bubble', m.sender === 'user' ? 'is-user' : 'is-assistant', 'is-compact'].filter(Boolean).join(' ')}>
                 <MessageBody text={m.text} />
+                {m.action && (
+                  <div style={{ marginTop: 'var(--sp-2)' }}>
+                    <Button
+                      size="sm"
+                      variant={actionDone[m.id] ? 'outline' : 'primary'}
+                      icon={actionDone[m.id] ? 'check' : (m.action.action_type === 'add_to_backlog' ? 'plus' : 'zap')}
+                      disabled={actionDone[m.id] || actionLoading[m.id]}
+                      loading={actionLoading[m.id]}
+                      onClick={() => runAction(m.action, m.id)}
+                    >
+                      {actionDone[m.id] ? 'Added to Backlog ✓' : (m.action.label || 'Take Action')}
+                    </Button>
+                  </div>
+                )}
               </div>
             </div>
           ))}

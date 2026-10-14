@@ -13,7 +13,19 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
 from config import settings
-from services.ai_service import get_gemini_client, get_groq_client, get_mistral_client, _extract_json_from_text, GEMINI_MODELS, GROQ_MODELS, MISTRAL_MODELS
+from services.ai_service import (
+    get_gemini_client,
+    get_groq_client,
+    get_mistral_client,
+    get_openrouter_client,
+    _extract_json_from_text,
+    GEMINI_MODELS,
+    GROQ_MODELS,
+    MISTRAL_MODELS,
+    OPENROUTER_MAX_TOKENS,
+    OPENROUTER_MODELS,
+    OPENROUTER_TIMEOUT_SECONDS,
+)
 from services.prd_service import build_document_evidence, get_prd_by_id
 from services.text_mining import match_records_by_terms
 from services.theme_extraction import _resolve_sentiment
@@ -22,6 +34,22 @@ from database import db
 import fallback_db
 
 logger = logging.getLogger(__name__)
+
+# The estimation scale this service documents. A model asked for Fibonacci points
+# sometimes answers 11 or 12, and a board has no column for those — so the value is
+# snapped to the nearest step instead of being passed through to the card.
+STORY_POINT_SCALE = (1, 2, 3, 5, 8, 13)
+
+
+def to_fibonacci_points(value: Any) -> int:
+    """Snap a story's estimate onto the Fibonacci scale, defaulting when it is unusable."""
+    try:
+        raw = float(value)
+    except (TypeError, ValueError):
+        return 3
+    if raw != raw:  # NaN
+        return 3
+    return min(STORY_POINT_SCALE, key=lambda step: abs(step - raw))
 
 
 def _normalise_phrase(text: str) -> str:
@@ -308,31 +336,88 @@ Rules:
     parsed_stories = None
     ai_model_used = None
 
-    # 1. Attempt Google Gemini Pure AI
-    gem_client = get_gemini_client()
-    if gem_client:
-        for g_model in GEMINI_MODELS:
+    # 1. Attempt Groq AI (Fastest, verified working)
+    groq_client = get_groq_client()
+    if groq_client:
+        for m_name in GROQ_MODELS:
             try:
-                from google.genai import types
-                logger.info(f"Generating user stories with Google Gemini model {g_model}...")
-                response = gem_client.models.generate_content(
-                    model=g_model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.25,
-                    ),
+                logger.info(f"Attempting Groq story generation with {m_name}...")
+                supports_json = m_name in ["allam-2-7b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+                response = groq_client.chat.completions.create(
+                    model=m_name,
+                    messages=[
+                        {"role": "system", "content": "You are a Principal Agile Product Owner. Respond ONLY in valid JSON."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.2,
+                    max_tokens=2500,
+                    timeout=20,
+                    response_format={"type": "json_object"} if supports_json else None
                 )
-                parsed = _extract_json_from_text(response.text)
+                content = response.choices[0].message.content
+                parsed = _extract_json_from_text(content)
                 if parsed and "stories" in parsed and isinstance(parsed["stories"], list):
                     parsed_stories = parsed["stories"]
-                    ai_model_used = f"Google Gemini ({g_model})"
-                    logger.info(f"Generated {len(parsed_stories)} user stories via Gemini!")
+                    ai_model_used = f"Groq ({m_name})"
+                    logger.info(f"Generated {len(parsed_stories)} user stories via Groq!")
                     break
             except Exception as e:
-                logger.warning(f"Gemini story generation error on {g_model}: {e}. Retrying next...")
+                logger.warning(f"Groq story error on {m_name}: {e}...")
 
-    # 2. Attempt Mistral AI Fallback (free Experiment tier, OpenAI-compatible)
+    # 2. Attempt OpenRouter Free AI Fallback
+    if not parsed_stories:
+        openrouter_client = get_openrouter_client()
+        if openrouter_client:
+            for m_name in OPENROUTER_MODELS:
+                try:
+                    logger.info(f"Attempting OpenRouter story generation with {m_name}...")
+                    response = openrouter_client.chat.completions.create(
+                        model=m_name,
+                        messages=[
+                            {"role": "system", "content": "You are a Principal Agile Product Owner. Respond ONLY in valid JSON."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        temperature=0.2,
+                        max_tokens=OPENROUTER_MAX_TOKENS,
+                        timeout=OPENROUTER_TIMEOUT_SECONDS,
+                    )
+                    content = response.choices[0].message.content
+                    parsed = _extract_json_from_text(content)
+                    if parsed and "stories" in parsed and isinstance(parsed["stories"], list):
+                        parsed_stories = parsed["stories"]
+                        ai_model_used = f"OpenRouter ({m_name})"
+                        logger.info(f"Generated {len(parsed_stories)} user stories via OpenRouter!")
+                        break
+                except Exception as e:
+                    logger.warning(f"OpenRouter story error on {m_name}: {e}...")
+
+    # 3. Attempt Google Gemini Backup
+    if not parsed_stories:
+        gem_client = get_gemini_client()
+        if gem_client:
+            for g_model in GEMINI_MODELS:
+                try:
+                    from google.genai import types
+                    logger.info(f"Generating user stories with Google Gemini model {g_model}...")
+                    response = gem_client.models.generate_content(
+                        model=g_model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.25,
+                            timeout=15,
+                        ),
+                    )
+                    parsed = _extract_json_from_text(response.text)
+                    if parsed and "stories" in parsed and isinstance(parsed["stories"], list):
+                        parsed_stories = parsed["stories"]
+                        ai_model_used = f"Google Gemini ({g_model})"
+                        logger.info(f"Generated {len(parsed_stories)} user stories via Gemini!")
+                        break
+                except Exception as e:
+                    logger.warning(f"Gemini story generation error on {g_model}: {e}. Retrying next...")
+
+    # 4. Attempt Mistral AI Fallback (free Experiment tier, OpenAI-compatible)
     if not parsed_stories:
         mistral_client = get_mistral_client()
         if mistral_client:
@@ -348,6 +433,7 @@ Rules:
                         temperature=0.2,
                         max_tokens=2500,
                         response_format={"type": "json_object"},
+                        timeout=20,
                     )
                     content = response.choices[0].message.content
                     parsed = _extract_json_from_text(content)
@@ -358,33 +444,6 @@ Rules:
                         break
                 except Exception as e:
                     logger.warning(f"Mistral story error on {m_name}: {e}...")
-
-    # 3. Attempt Groq AI Fallback
-    if not parsed_stories:
-        groq_client = get_groq_client()
-        if groq_client:
-            for m_name in GROQ_MODELS:
-                try:
-                    logger.info(f"Attempting Groq story generation with {m_name}...")
-                    response = groq_client.chat.completions.create(
-                        model=m_name,
-                        messages=[
-                            {"role": "system", "content": "You are a Principal Agile Product Owner. Respond ONLY in valid JSON."},
-                            {"role": "user", "content": prompt},
-                        ],
-                        temperature=0.2,
-                        max_tokens=2500,
-                        response_format={"type": "json_object"} if m_name in ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"] else None
-                    )
-                    content = response.choices[0].message.content
-                    parsed = _extract_json_from_text(content)
-                    if parsed and "stories" in parsed and isinstance(parsed["stories"], list):
-                        parsed_stories = parsed["stories"]
-                        ai_model_used = f"Groq ({m_name})"
-                        logger.info("Generated user stories via Groq fallback!")
-                        break
-                except Exception as e:
-                    logger.warning(f"Groq story error on {m_name}: {e}...")
 
     # 3. Fallback Deterministic Engine
     if not parsed_stories:
@@ -436,7 +495,7 @@ Rules:
             "benefit": benefit,
             "full_statement": full_stmt,
             "acceptance_criteria": s.get("acceptance_criteria", []),
-            "story_points": int(s.get("story_points", 3)),
+            "story_points": to_fibonacci_points(s.get("story_points", 3)),
             "t_shirt_size": s.get("t_shirt_size", "M"),
             "priority": s.get("priority", "medium"),
             "status": "backlog",

@@ -12,7 +12,18 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
 from config import settings
-from services.ai_service import get_gemini_client, get_groq_client, get_mistral_client, _extract_json_from_text, GEMINI_MODELS, GROQ_MODELS, MISTRAL_MODELS
+from services.ai_service import (
+    get_gemini_client,
+    get_groq_client,
+    get_mistral_client,
+    get_openrouter_client,
+    _extract_json_from_text,
+    GEMINI_MODELS,
+    GROQ_MODELS,
+    MISTRAL_MODELS,
+    OPENROUTER_MAX_TOKENS,
+    OPENROUTER_MODELS,
+)
 from services.text_mining import (
     REQUEST_MARKERS,
     content_tokens,
@@ -659,31 +670,88 @@ Ensure:
     parsed_result = None
     ai_model_used = None
 
-    # 1. Attempt Google Gemini Pure AI
-    gem_client = get_gemini_client()
-    if gem_client:
-        for g_model in GEMINI_MODELS:
+    # 1. Attempt Groq AI (Fastest, verified working)
+    groq_client = get_groq_client()
+    if groq_client:
+        for m_name in GROQ_MODELS:
             try:
-                from google.genai import types
-                logger.info(f"Generating PRD with Google Gemini model {g_model}...")
-                response = gem_client.models.generate_content(
-                    model=g_model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.25,
-                    ),
+                logger.info(f"Attempting Groq PRD generation using {m_name}...")
+                supports_json = m_name in ["allam-2-7b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+                response = groq_client.chat.completions.create(
+                    model=m_name,
+                    messages=[
+                        {"role": "system", "content": "You are a Principal Product Manager. Respond ONLY in valid JSON."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.2,
+                    max_tokens=3200,
+                    timeout=20,
+                    response_format={"type": "json_object"} if supports_json else None
                 )
-                parsed = _extract_json_from_text(response.text)
-                if parsed and "functional_requirements" in parsed and "problem_statement" in parsed:
+                content = response.choices[0].message.content
+                parsed = _extract_json_from_text(content)
+                if parsed and "functional_requirements" in parsed:
                     parsed_result = parsed
-                    ai_model_used = f"Google Gemini ({g_model})"
-                    logger.info("PRD generated successfully with Google Gemini!")
+                    ai_model_used = f"Groq ({m_name})"
+                    logger.info("PRD generated successfully with Groq AI!")
                     break
             except Exception as e:
-                logger.warning(f"Gemini PRD generation error on {g_model}: {e}. Retrying next...")
+                logger.warning(f"Groq PRD generation error on {m_name}: {e}...")
 
-    # 2. Attempt Mistral AI Fallback (free Experiment tier, OpenAI-compatible)
+    # 2. Attempt OpenRouter Free AI Fallback
+    if not parsed_result:
+        openrouter_client = get_openrouter_client()
+        if openrouter_client:
+            for m_name in OPENROUTER_MODELS:
+                try:
+                    logger.info(f"Attempting OpenRouter PRD generation using {m_name}...")
+                    response = openrouter_client.chat.completions.create(
+                        model=m_name,
+                        messages=[
+                            {"role": "system", "content": "You are a Principal Product Manager. Respond ONLY in valid JSON."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        temperature=0.2,
+                        max_tokens=OPENROUTER_MAX_TOKENS,
+                        timeout=OPENROUTER_TIMEOUT_SECONDS,
+                    )
+                    content = response.choices[0].message.content
+                    parsed = _extract_json_from_text(content)
+                    if parsed and "functional_requirements" in parsed:
+                        parsed_result = parsed
+                        ai_model_used = f"OpenRouter ({m_name})"
+                        logger.info("PRD generated successfully with OpenRouter AI!")
+                        break
+                except Exception as e:
+                    logger.warning(f"OpenRouter PRD generation error on {m_name}: {e}...")
+
+    # 3. Attempt Google Gemini Backup
+    if not parsed_result:
+        gem_client = get_gemini_client()
+        if gem_client:
+            for g_model in GEMINI_MODELS:
+                try:
+                    from google.genai import types
+                    logger.info(f"Generating PRD with Google Gemini model {g_model}...")
+                    response = gem_client.models.generate_content(
+                        model=g_model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.25,
+                            timeout=15,
+                        ),
+                    )
+                    parsed = _extract_json_from_text(response.text)
+                    if parsed and "functional_requirements" in parsed and "problem_statement" in parsed:
+                        parsed_result = parsed
+                        ai_model_used = f"Google Gemini ({g_model})"
+                        logger.info("PRD generated successfully with Google Gemini!")
+                        break
+                except Exception as e:
+                    logger.warning(f"Gemini PRD generation error on {g_model}: {e}. Retrying next...")
+
+    # 4. Attempt Mistral AI Fallback (free Experiment tier, OpenAI-compatible)
     if not parsed_result:
         mistral_client = get_mistral_client()
         if mistral_client:
@@ -699,6 +767,7 @@ Ensure:
                         temperature=0.2,
                         max_tokens=3200,
                         response_format={"type": "json_object"},
+                        timeout=20,
                     )
                     content = response.choices[0].message.content
                     parsed = _extract_json_from_text(content)
@@ -709,33 +778,6 @@ Ensure:
                         break
                 except Exception as e:
                     logger.warning(f"Mistral PRD generation error on {m_name}: {e}...")
-
-    # 3. Attempt Groq AI Fallback
-    if not parsed_result:
-        groq_client = get_groq_client()
-        if groq_client:
-            for m_name in GROQ_MODELS:
-                try:
-                    logger.info(f"Attempting Groq PRD generation using {m_name}...")
-                    response = groq_client.chat.completions.create(
-                        model=m_name,
-                        messages=[
-                            {"role": "system", "content": "You are a Principal Product Manager. Respond ONLY in valid JSON."},
-                            {"role": "user", "content": prompt},
-                        ],
-                        temperature=0.2,
-                        max_tokens=3200,
-                        response_format={"type": "json_object"} if m_name in ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"] else None
-                    )
-                    content = response.choices[0].message.content
-                    parsed = _extract_json_from_text(content)
-                    if parsed and "functional_requirements" in parsed:
-                        parsed_result = parsed
-                        ai_model_used = f"Groq ({m_name})"
-                        logger.info("PRD generated successfully with Groq AI fallback!")
-                        break
-                except Exception as e:
-                    logger.warning(f"Groq PRD generation error on {m_name}: {e}...")
 
     if parsed_result:
         evidence["generation_method"] = ai_model_used or "AI provider"

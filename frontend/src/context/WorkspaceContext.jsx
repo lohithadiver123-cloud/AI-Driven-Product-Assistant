@@ -33,6 +33,7 @@ export function WorkspaceProvider({ children }) {
 
   const persist = useCallback((id) => {
     setActiveId(id);
+    api.clearCache?.();
     try {
       if (id) localStorage.setItem(STORAGE_KEY, id);
       else localStorage.removeItem(STORAGE_KEY);

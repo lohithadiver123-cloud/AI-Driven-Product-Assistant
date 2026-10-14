@@ -23,12 +23,20 @@ export function BusyProvider({ children }) {
     return () => {
       if (ended) return;
       ended = true;
-      setCount((c) => Math.max(0, c - 1));
+      setCount((c) => {
+        const next = Math.max(0, c - 1);
+        if (next === 0) setLabel('');
+        return next;
+      });
     };
   }, []);
 
   const end = useCallback(() => {
-    setCount((c) => Math.max(0, c - 1));
+    setCount((c) => {
+      const next = Math.max(0, c - 1);
+      if (next === 0) setLabel('');
+      return next;
+    });
   }, []);
 
   /** Wrap an async call so the bar shows for exactly its lifetime. */

@@ -1,4 +1,4 @@
-import { Suspense } from 'react';
+import { Suspense, ViewTransition } from 'react';
 import { Outlet } from 'react-router-dom';
 import Navbar from './Navbar';
 import FloatingCopilot from './FloatingCopilot';
@@ -33,7 +33,21 @@ export default function AppLayout() {
       <div className="app-container">
         <Navbar />
         <main className="app-main">
-          <Suspense fallback={<RouteFallback />}>
+          {/* The skeleton is only ever seen while a route's code and its first
+              payload are in flight. It sinks away as the real page arrives,
+              so the swap reads as content landing rather than as a flash.
+
+              Deliberately only the fallback is wrapped: the entering page is
+              already a view-transition boundary of its own (see
+              ViewTransitions.jsx), and a wrapper here would own the mutation
+              and swallow it. */}
+          <Suspense
+            fallback={
+              <ViewTransition exit="vt-slide-down">
+                <RouteFallback />
+              </ViewTransition>
+            }
+          >
             <Outlet />
           </Suspense>
         </main>

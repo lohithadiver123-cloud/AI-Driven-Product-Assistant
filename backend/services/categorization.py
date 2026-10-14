@@ -24,17 +24,23 @@ CATEGORY_KEYWORDS: Dict[str, List[str]] = {
         "keeps closing", "closes", "shuts down", "black screen", "blank screen",
         "no sound", "wont load", "won't load", "wont play", "won't play", "cant open",
         "can't open", "cannot open", "cant log", "can't log", "stopped", "disappeared",
-        "keeps stopping", "signed out", "logs me out",
+        "keeps stopping", "signed out", "logs me out", "missing item", "missing items",
+        "missing food", "missing drink", "missing dessert", "missing order", "wrong order",
+        "wrong item", "spilled", "not delivered", "fees add up", "overcharged",
     ],
     "feature_request": [
-        "feature", "features", "wish", "add", "adds", "adding", "would like",
+        "feature", "features", "wish", "would like",
         "could you", "please add", "suggestion", "suggestions", "improve", "improved",
         "enhancement", "request", "requests", "want", "wants", "need", "needs",
-        "missing", "it would be great", "would be great", "would be nice",
+        "it would be great", "would be great", "would be nice",
         "it would be nice", "would be helpful", "support for", "ability to",
         "option to", "option for", "can we", "is there a way", "how about",
         "would love", "bring back", "please bring", "restore", "allow us", "let us",
         "why cant", "why can't", "when will", "should have", "upgrade",
+        "could you add", "would like to see", "add support", "add option",
+        "add feature", "add ability", "add filter", "add button", "add payment",
+        "missing feature", "missing option", "missing capability", "wish there was",
+        "requesting", "suggest adding", "it would help if", "can you provide",
     ],
     "performance_issue": [
         "slow", "slower", "slowness", "lag", "laggy", "lagging", "performance",
@@ -51,7 +57,9 @@ POSITIVE_KEYWORDS: List[str] = [
     "nice", "perfect", "wonderful", "best", "brilliant", "helpful", "easy", "smooth",
     "fast", "reliable", "recommend", "recommended", "thank", "thanks", "pleased",
     "satisfied", "impressed", "enjoy", "enjoying", "happy", "delighted", "superb",
-    "outstanding", "useful", "handy", "convenient",
+    "outstanding", "useful", "handy", "convenient", "on time", "warm", "quick",
+    "quickly", "prompt", "promptly", "polite", "delicious", "fresh", "generous",
+    "honest", "smoothly", "flawless", "courteous", "friendly", "fair price", "seamless",
 ]
 
 NEGATIVE_KEYWORDS: List[str] = [
@@ -60,8 +68,12 @@ NEGATIVE_KEYWORDS: List[str] = [
     "waste", "broken", "slow", "crash", "crashes", "error", "errors", "fail", "fails",
     "bug", "bugs", "painful", "unacceptable", "unusable", "rage", "angry", "upset",
     "sucks", "garbage", "refund", "uninstall", "delete", "never again", "trash",
-    "scam", "rip off", "worse",
+    "scam", "rip off", "worse", "missing", "wrong", "cold", "soggy", "spilled",
+    "no help", "unhelpful", "closed ticket", "closed the ticket", "did not fix",
+    "could not fix", "not delivered", "overcharged", "charging extra", "disappeared",
+    "draining", "drain", "lags", "lagging", "fees add up",
 ]
+
 
 
 def _build_matchers(keywords: List[str]) -> Tuple[Optional[re.Pattern], Optional[re.Pattern]]:

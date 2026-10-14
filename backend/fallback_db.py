@@ -21,6 +21,10 @@ _users_cache: Dict[str, Dict] = {}
 _workspaces_cache: Dict[str, Dict] = {}
 _feedback_cache: Dict[str, Dict] = {}
 
+# Parsed-file cache, keyed by path. See _read_collection() for why this exists.
+_PARSED: Dict[str, List[Dict]] = {}
+_CACHE_MTIME: Dict[str, float] = {}
+
 
 def _load_json(filepath: str) -> List[Dict]:
     """Load JSON file or return empty list."""
@@ -37,20 +41,52 @@ def _save_json(filepath: str, data: List[Dict]) -> None:
     """Save data to JSON file."""
     with open(filepath, 'w') as f:
         json.dump(data, f, indent=2, default=str)
+    # Our own write is the newest known state, so record it instead of forcing the next
+    # read to re-parse what we just serialised.
+    _PARSED[filepath] = data
+    try:
+        _CACHE_MTIME[filepath] = os.path.getmtime(filepath)
+    except OSError:
+        _CACHE_MTIME.pop(filepath, None)
+
+
+def _read_collection(filepath: str) -> List[Dict]:
+    """
+    Return the parsed contents of a JSON collection, re-parsing only when it changed.
+
+    Every fallback operation used to call json.load() on all three core files, so a single
+    request re-parsed the whole feedback corpus from disk — at one point 54 MB, measured at
+    ~0.5 s per call, on operations as small as a user lookup. Caching by modification time
+    keeps the parse to once per process while still noticing a write made by any process.
+    """
+    try:
+        mtime = os.path.getmtime(filepath)
+    except OSError:
+        return []
+    if _CACHE_MTIME.get(filepath) == mtime:
+        return _PARSED.get(filepath, [])
+    data = _load_json(filepath)
+    _PARSED[filepath] = data
+    _CACHE_MTIME[filepath] = mtime
+    return data
+
+
+def _index_by(filepath: str, key: str) -> Dict[str, Dict]:
+    """Load a JSON collection and index it by one of its fields."""
+    return {
+        str(row[key]): row
+        for row in _read_collection(filepath)
+        if isinstance(row, dict) and key in row
+    }
 
 
 def _load_cache() -> None:
-    """Load all data from JSON files into memory."""
+    """Load all core data from JSON files into memory."""
     global _users_cache, _workspaces_cache, _feedback_cache
-    
-    users = _load_json(USERS_FILE)
-    _users_cache = {u['_id']: u for u in users}
-    
-    workspaces = _load_json(WORKSPACES_FILE)
-    _workspaces_cache = {w['_id']: w for w in workspaces}
-    
-    feedback = _load_json(FEEDBACK_FILE)
-    _feedback_cache = {f['_id']: f for f in feedback}
+
+    _users_cache = _index_by(USERS_FILE, '_id')
+    _workspaces_cache = _index_by(WORKSPACES_FILE, '_id')
+    _feedback_cache = _index_by(FEEDBACK_FILE, '_id')
 
 
 def _save_all() -> None:
@@ -118,6 +154,12 @@ async def find_workspaces_by_user(user_id: str) -> List[Dict]:
     return [w for w in _workspaces_cache.values() if w.get('created_by') == user_id]
 
 
+async def find_workspace_by_id(workspace_id: str) -> Optional[Dict]:
+    """Find a single workspace by its own id."""
+    _load_cache()
+    return _workspaces_cache.get(str(workspace_id))
+
+
 # ============= Feedback Operations =============
 
 async def create_feedback(feedback_data: Dict[str, Any]) -> Dict:
@@ -179,8 +221,7 @@ _insights_cache: Dict[str, Dict] = {}
 
 def _load_insights_cache() -> None:
     global _insights_cache
-    insights = _load_json(INSIGHTS_FILE)
-    _insights_cache = {i['workspace_id']: i for i in insights if isinstance(i, dict) and 'workspace_id' in i}
+    _insights_cache = _index_by(INSIGHTS_FILE, 'workspace_id')
 
 
 async def save_workspace_insights(workspace_id: str, insights_data: Dict[str, Any]) -> Dict:
@@ -204,8 +245,7 @@ _prds_cache: Dict[str, Dict] = {}
 
 def _load_prds_cache() -> None:
     global _prds_cache
-    prds = _load_json(PRDS_FILE)
-    _prds_cache = {p['id']: p for p in prds if isinstance(p, dict) and 'id' in p}
+    _prds_cache = _index_by(PRDS_FILE, 'id')
 
 async def save_prd(prd_data: Dict[str, Any]) -> Dict[str, Any]:
     _load_prds_cache()
@@ -245,8 +285,7 @@ _stories_cache: Dict[str, Dict] = {}
 
 def _load_stories_cache() -> None:
     global _stories_cache
-    stories = _load_json(STORIES_FILE)
-    _stories_cache = {s['id']: s for s in stories if isinstance(s, dict) and 'id' in s}
+    _stories_cache = _index_by(STORIES_FILE, 'id')
 
 async def save_user_story(story_data: Dict[str, Any]) -> Dict[str, Any]:
     _load_stories_cache()
@@ -298,13 +337,11 @@ _weights_cache: Dict[str, Dict] = {}
 
 def _load_prioritization_cache() -> None:
     global _prioritization_cache
-    items = _load_json(PRIORITIZATION_FILE)
-    _prioritization_cache = {i['id']: i for i in items if isinstance(i, dict) and 'id' in i}
+    _prioritization_cache = _index_by(PRIORITIZATION_FILE, 'id')
 
 def _load_weights_cache() -> None:
     global _weights_cache
-    weights = _load_json(WEIGHTS_FILE)
-    _weights_cache = {w['workspace_id']: w for w in weights if isinstance(w, dict) and 'workspace_id' in w}
+    _weights_cache = _index_by(WEIGHTS_FILE, 'workspace_id')
 
 async def save_prioritization_item(item_data: Dict[str, Any]) -> Dict[str, Any]:
     _load_prioritization_cache()
@@ -363,7 +400,7 @@ _copilot_cache: List[Dict] = []
 
 def _load_copilot_cache() -> None:
     global _copilot_cache
-    _copilot_cache = _load_json(COPILOT_FILE)
+    _copilot_cache = _read_collection(COPILOT_FILE)
 
 async def save_copilot_message(msg_data: Dict[str, Any]) -> Dict[str, Any]:
     _load_copilot_cache()
@@ -387,6 +424,68 @@ async def clear_copilot_history(workspace_id: str, session_id: Optional[str] = N
         _copilot_cache = [m for m in _copilot_cache if m.get('workspace_id') != workspace_id]
     _save_json(COPILOT_FILE, _copilot_cache)
     return True
+
+# ============= Milestone 4: Roadmap Operations =============
+
+ROADMAPS_FILE = os.path.join(DATA_DIR, "roadmaps.json")
+_roadmaps_cache: Dict[str, Dict] = {}
+
+def _load_roadmaps_cache() -> None:
+    global _roadmaps_cache
+    _roadmaps_cache = _index_by(ROADMAPS_FILE, 'workspace_id')
+
+async def save_roadmap(roadmap_data: Dict[str, Any]) -> Dict[str, Any]:
+    """One roadmap per workspace — saving replaces the previous plan."""
+    _load_roadmaps_cache()
+    _roadmaps_cache[roadmap_data['workspace_id']] = roadmap_data
+    _save_json(ROADMAPS_FILE, list(_roadmaps_cache.values()))
+    return roadmap_data
+
+async def get_roadmap(workspace_id: str) -> Optional[Dict]:
+    _load_roadmaps_cache()
+    return _roadmaps_cache.get(workspace_id)
+
+async def delete_roadmap(workspace_id: str) -> bool:
+    _load_roadmaps_cache()
+    if workspace_id in _roadmaps_cache:
+        del _roadmaps_cache[workspace_id]
+        _save_json(ROADMAPS_FILE, list(_roadmaps_cache.values()))
+        return True
+    return False
+
+
+# ============= Milestone 4: Report Operations =============
+
+REPORTS_FILE = os.path.join(DATA_DIR, "reports.json")
+_reports_cache: Dict[str, Dict] = {}
+
+def _load_reports_cache() -> None:
+    global _reports_cache
+    _reports_cache = _index_by(REPORTS_FILE, 'id')
+
+async def save_report(report_data: Dict[str, Any]) -> Dict[str, Any]:
+    _load_reports_cache()
+    _reports_cache[report_data['id']] = report_data
+    _save_json(REPORTS_FILE, list(_reports_cache.values()))
+    return report_data
+
+async def find_reports_by_workspace(workspace_id: str) -> List[Dict]:
+    _load_reports_cache()
+    reports = [r for r in _reports_cache.values() if r.get('workspace_id') == workspace_id]
+    return sorted(reports, key=lambda r: str(r.get('created_at') or ''), reverse=True)
+
+async def find_report_by_id(report_id: str) -> Optional[Dict]:
+    _load_reports_cache()
+    return _reports_cache.get(report_id)
+
+async def delete_report(report_id: str) -> bool:
+    _load_reports_cache()
+    if report_id in _reports_cache:
+        del _reports_cache[report_id]
+        _save_json(REPORTS_FILE, list(_reports_cache.values()))
+        return True
+    return False
+
 
 print("Fallback JSON database loaded")
 

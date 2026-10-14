@@ -20,6 +20,8 @@ env/
 # Node / Frontend
 node_modules/
 dist/
+frontend/dist/
+frontend/node_modules/
 .next/
 .nuxt/
 *.timestamp-*.mjs
@@ -27,14 +29,42 @@ vite.config.*.mjs
 
 # Local Demo Data
 .demo_data/
+backend/.demo_data/
 
-# IDE / OS
+# One-off data migrations keep a full pre-change backup, which can be tens of MB
+.migrations/
+backend/.migrations/
+
+# IDE / OS / Temp
 .vscode/
 .idea/
 .freebuff/
 *.DS_Store
 Thumbs.db
+~$*
+*.tmp
+*.openapi_tmp.json
+backend/.openapi_tmp.json
+verification_results.json
 
 # Logs
 *.log
 npm-debug.log*
+
+# Office / Presentations / Spreadsheet trackers
+*.pptx
+*.xlsx
+PM_Copilot_Presentation.html
+
+# Large external datasets (keep MunchMate_500_reviews.csv for demo)
+Spotify.csv
+instagram_reviews.csv
+
+# Scratch docs & agent handoffs
+HANDOFF.md
+WORKED_SO_FAR.md
+run_demo_verification.py
+
+# Documentation binaries & prototypes
+docs/PM_Copilot_Technical_Documentation.docx
+docs/prototypes/

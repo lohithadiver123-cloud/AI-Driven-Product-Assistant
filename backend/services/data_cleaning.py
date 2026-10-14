@@ -144,8 +144,7 @@ async def clean_workspace_feedback(workspace_id: str) -> Dict[str, int]:
     )
     records = await cursor.to_list(length=None)
 
-    updated_count = 0
-
+    operations = []
     for record in records:
         record_id = record["_id"]
 
@@ -161,19 +160,25 @@ async def clean_workspace_feedback(workspace_id: str) -> Dict[str, int]:
         original_name = record.get("customer_name")
         cleaned_name = str(original_name).strip() if original_name else None
 
-        # Update the record
-        await db.feedback.update_one(
-            {"_id": record_id},
+        operations.append((
+            record_id,
             {
-                "$set": {
-                    "content": cleaned_content,
-                    "title": cleaned_title,
-                    "customer_name": cleaned_name,
-                    "cleaned": True,
-                }
+                "content": cleaned_content,
+                "title": cleaned_title,
+                "customer_name": cleaned_name,
+                "cleaned": True,
             }
-        )
-        updated_count += 1
+        ))
+
+    from pymongo import UpdateOne
+
+    updated_count = 0
+    if operations:
+        for start in range(0, len(operations), 500):
+            chunk = operations[start : start + 500]
+            writes = [UpdateOne({"_id": rec_id}, {"$set": fields}) for rec_id, fields in chunk]
+            result = await db.feedback.bulk_write(writes, ordered=False)
+            updated_count += result.modified_count
 
     # Remove duplicates
     dup_result = await remove_duplicates(workspace_id)

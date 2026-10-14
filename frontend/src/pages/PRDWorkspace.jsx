@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import api from '../services/api';
 import Icon from '../components/Icon';
+import { NAV_FORWARD, navigateWithType } from '../components/ViewTransitions';
 import { useBusy } from '../context/BusyContext';
 import { useWorkspaces } from '../context/WorkspaceContext';
 import {
@@ -12,8 +13,9 @@ import {
   CardBody,
   CardHeader,
   EmptyState,
-  IconButton,
+  Hint,
   Input,
+  Menu,
   Modal,
   PageHeader,
   ProgressBar,
@@ -23,15 +25,21 @@ import {
   SkeletonList,
   Tabs,
   Textarea,
-  WorkspaceSwitcher,
 } from '../components/ui';
 
 const STATUS_TONE = { draft: 'neutral', in_review: 'warning', approved: 'success', archived: 'neutral' };
+const STATUS_LABEL = { draft: 'Draft', in_review: 'In review', approved: 'Approved', archived: 'Archived' };
 const SOURCE_LABEL = {
   feature_cluster: 'Feature cluster',
   pain_point: 'Pain point',
   custom: 'Custom brief',
 };
+
+const slug = (value) =>
+  String(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
 
 const GENERATION_STEPS = [
   'Reading the feedback records for this workspace',
@@ -54,7 +62,7 @@ const asList = (payload, key) => {
 /** One numbered section of the document — same shape for all of them. */
 function DocSection({ index, title, children }) {
   return (
-    <section className="doc-section">
+    <section className="doc-section" id={`doc-${slug(title)}`}>
       <h3 className="section-title">
         <span className="sec-num" aria-hidden="true">
           {index}
@@ -67,6 +75,26 @@ function DocSection({ index, title, children }) {
 }
 
 /**
+ * The sections a document actually has, in order, for the sticky outline.
+ * Built from the same presence checks the body uses, so the outline can never
+ * offer a jump to a section that was not rendered.
+ */
+function docOutline(doc) {
+  if (!doc) return [];
+  return [
+    { title: 'Executive summary', present: true },
+    { title: 'Customer problem and evidence', present: true },
+    { title: 'Strategic goals', present: Boolean(doc.goals_and_objectives?.length) },
+    { title: 'Target users', present: Boolean(doc.target_users_and_personas?.length) },
+    { title: 'Scope', present: true },
+    { title: 'Functional requirements', present: Boolean(doc.functional_requirements?.length) },
+    { title: 'Non-functional requirements', present: Boolean(doc.non_functional_requirements?.length) },
+    { title: 'Success metrics', present: Boolean(doc.success_metrics_kpis?.length) },
+    { title: 'Risks and mitigations', present: Boolean(doc.risks_and_mitigations?.length) },
+  ].filter((entry) => entry.present);
+}
+
+/**
  * PRD Studio — the document side of the workflow.
  *
  * Documents on the left, the selected one on the right. The page has one
@@ -75,15 +103,21 @@ function DocSection({ index, title, children }) {
  */
 export default function PRDWorkspace() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const { prdId } = useParams();
   const { begin } = useBusy();
 
   const { activeId: workspaceId, ready } = useWorkspaces();
-  const [prds, setPrds] = useState([]);
-  const [selected, setSelected] = useState(null);
-  const [clusters, setClusters] = useState([]);
-  const [painPoints, setPainPoints] = useState([]);
+  const [prds, setPrds] = useState(() => (workspaceId ? api.getCached(`/prd/workspace/${workspaceId}`) || [] : []));
+  const [selected, setSelected] = useState(() => {
+    if (!workspaceId) return null;
+    const cached = api.getCached(`/prd/workspace/${workspaceId}`);
+    return (prdId ? cached?.find((p) => p.id === prdId) : null) || cached?.[0] || null;
+  });
+  const [clusters, setClusters] = useState(() => (workspaceId ? asList(api.getCached(`/insights/${workspaceId}/clusters`), 'clusters') || [] : []));
+  const [painPoints, setPainPoints] = useState(() => (workspaceId ? asList(api.getCached(`/insights/${workspaceId}/pain-points`), 'pain_points') || [] : []));
 
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => !workspaceId || !api.getCached(`/prd/workspace/${workspaceId}`));
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [contextError, setContextError] = useState('');
@@ -100,6 +134,21 @@ export default function PRDWorkspace() {
   const [title, setTitle] = useState('');
   const [audience, setAudience] = useState('');
   const [tone, setTone] = useState('comprehensive');
+
+  // Handoff from Copilot or other pages via route state
+  useEffect(() => {
+    const pf = location.state?.prefill || (location.state?.sourceType ? location.state : null);
+    if (pf) {
+      if (pf.title) setTitle(pf.title);
+      if (pf.prompt) setPrompt(pf.prompt);
+      if (pf.sourceType) setSourceType(pf.sourceType === 'feature_cluster' ? 'cluster' : pf.sourceType);
+      if (pf.clusterId) setClusterId(pf.clusterId);
+      if (pf.painPointId) setPainPointId(pf.painPointId);
+      if (pf.audience) setAudience(pf.audience);
+      if (pf.tone) setTone(pf.tone);
+      setShowGenerate(true);
+    }
+  }, [location.state]);
 
   const loadContext = useCallback(async (id) => {
     const [clusterResult, painResult] = await Promise.allSettled([
@@ -119,12 +168,19 @@ export default function PRDWorkspace() {
 
   const loadPrds = useCallback(async (id) => {
     if (!id) return;
-    setLoading(true);
+    if (!api.getCached(`/prd/workspace/${id}`)) {
+      setLoading(true);
+    }
     setError('');
     try {
       const { data } = await api.get(`/prd/workspace/${id}`);
       setPrds(data);
-      setSelected((current) => data.find((p) => p.id === current?.id) || data[0] || null);
+      setSelected((current) =>
+        (prdId ? data.find((p) => p.id === prdId) : null) ||
+        data.find((p) => p.id === current?.id) ||
+        data[0] ||
+        null
+      );
     } catch {
       setError('Could not load the documents for this workspace.');
       setPrds([]);
@@ -132,7 +188,7 @@ export default function PRDWorkspace() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [prdId]);
 
   // Both lists follow the shared selection, so switching workspace anywhere in
   // the app reloads this page as well.
@@ -239,18 +295,55 @@ export default function PRDWorkspace() {
       <PageHeader
         icon="file"
         title="PRD Studio"
-        description="Requirement documents written from this workspace's own feedback — personas, scope, requirements, SLAs and metrics."
+        trail="prd"
+        description="Requirement documents written from this workspace's own feedback — personas, scope, requirements and metrics."
         actions={
           <>
-            <WorkspaceSwitcher />
-            <Button
-              variant="primary"
-              icon="sparkle"
-              disabled={!workspaceId}
-              onClick={() => setShowGenerate(true)}
-            >
-              Generate PRD
-            </Button>
+            <Menu
+              label="Documents"
+              items={[
+                {
+                  label: 'New document',
+                  icon: 'sparkle',
+                  disabled: !workspaceId,
+                  onSelect: () => setShowGenerate(true),
+                },
+                {
+                  label: 'Download as Markdown',
+                  icon: 'download',
+                  disabled: !selected?.raw_markdown,
+                  onSelect: downloadMarkdown,
+                },
+                {
+                  label: 'Delete this document',
+                  icon: 'trash',
+                  tone: 'danger',
+                  disabled: !selected,
+                  onSelect: () => setPendingDelete(selected),
+                },
+              ]}
+            />
+
+            {/* The one filled button is the one that moves the work forward:
+                a document that exists becomes stories; none becomes one. */}
+            {selected ? (
+              <Button
+                variant="primary"
+                icon="clipboard"
+                onClick={() => navigateWithType(navigate, `/user-stories?prd_id=${selected.id}`, NAV_FORWARD)}
+              >
+                Break into stories
+              </Button>
+            ) : (
+              <Button
+                variant="primary"
+                icon="sparkle"
+                disabled={!workspaceId}
+                onClick={() => setShowGenerate(true)}
+              >
+                Generate PRD
+              </Button>
+            )}
           </>
         }
       />
@@ -295,17 +388,21 @@ export default function PRDWorkspace() {
                       aria-current={isSelected}
                       onClick={() => setSelected(prd)}
                     >
-                      <div className="prd-item-top">
-                        <Badge tone={STATUS_TONE[prd.status] || 'neutral'}>
-                          {(prd.status || 'draft').replace(/_/g, ' ')}
-                        </Badge>
-                        <span className="prd-version">v{prd.version || '1.0'}</span>
-                      </div>
+                      {/* Title first: three drafts all showing “draft v1.0” made
+                          the list impossible to scan. */}
                       <span className="prd-item-title">{prd.title}</span>
                       <div className="prd-item-meta">
-                        <span>{SOURCE_LABEL[prd.source_type] || 'Custom brief'}</span>
                         <span>{new Date(prd.created_at).toLocaleDateString()}</span>
+                        <span>{SOURCE_LABEL[prd.source_type] || 'Custom brief'}</span>
+                        <span>v{prd.version || '1.0'}</span>
                       </div>
+                      {prd.status && prd.status !== 'draft' && (
+                        <div className="prd-item-top">
+                          <Badge tone={STATUS_TONE[prd.status] || 'neutral'}>
+                            {STATUS_LABEL[prd.status] || prd.status.replace(/_/g, ' ')}
+                          </Badge>
+                        </div>
+                      )}
                     </button>
                   </li>
                 );
@@ -350,6 +447,12 @@ export default function PRDWorkspace() {
                   <h2 className="doc-title">{selected.title}</h2>
                 </div>
 
+                {/*
+                 * One row, one decision. Status stays visible because it is
+                 * state rather than an action; everything else that used to sit
+                 * here at equal weight now lives in one menu, with delete kept
+                 * behind the confirmation modal it already had.
+                 */}
                 <div className="doc-actions">
                   <Select
                     value={selected.status || 'draft'}
@@ -362,46 +465,27 @@ export default function PRDWorkspace() {
                     <option value="archived">Archived</option>
                   </Select>
 
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    icon="file"
-                    onClick={copyMarkdown}
-                  >
-                    Copy
-                  </Button>
-
-                  <Button size="sm" variant="secondary" icon="download" onClick={downloadMarkdown}>
-                    Export
-                  </Button>
-
-                  <Button
-                    size="sm"
-                    variant="primary"
-                    icon="clipboard"
-                    onClick={() => navigate(`/user-stories?prd_id=${selected.id}`)}
-                  >
-                    Break into stories
-                  </Button>
-
-                  <IconButton
-                    icon="trash"
-                    variant="danger"
-                    label={`Delete ${selected.title}`}
-                    onClick={() => setPendingDelete(selected)}
+                  <Menu
+                    label="Share and export"
+                    items={[
+                      { label: 'Copy as Markdown', icon: 'file', onSelect: copyMarkdown },
+                      { label: 'Download .md', icon: 'download', onSelect: downloadMarkdown },
+                      {
+                        label: tab === 'markdown' ? 'Show as document' : 'Show raw Markdown',
+                        icon: 'code',
+                        onSelect: () => setTab(tab === 'markdown' ? 'structured' : 'markdown'),
+                      },
+                      {
+                        label: 'Delete document',
+                        icon: 'trash',
+                        tone: 'danger',
+                        onSelect: () => setPendingDelete(selected),
+                      },
+                    ]}
                   />
                 </div>
               </header>
 
-              <Segmented
-                label="Document view"
-                value={tab}
-                onChange={setTab}
-                options={[
-                  { value: 'structured', label: 'Document', icon: 'file' },
-                  { value: 'markdown', label: 'Markdown', icon: 'code' },
-                ]}
-              />
 
               {tab === 'markdown' ? (
                 <div className="markdown-view-container">
@@ -416,9 +500,59 @@ export default function PRDWorkspace() {
                   </pre>
                 </div>
               ) : (
+                <div className="doc-layout">
+                  {/* A long document needs a way to jump around it, and the
+                      outline is built from the sections actually rendered. */}
+                  <nav className="doc-outline" aria-label="Document sections">
+                    <span className="doc-outline-title">On this page</span>
+                    <ul>
+                      {docOutline(selected).map((entry) => (
+                        <li key={entry.title}>
+                          <a href={`#doc-${slug(entry.title)}`}>{entry.title}</a>
+                        </li>
+                      ))}
+                    </ul>
+                  </nav>
+
                 <div className="structured-doc-content">
+                  {/*
+                   * The summary used to be one dense paragraph. Three labelled
+                   * lines — what is wrong, what we are doing, what should
+                   * change — read in a glance; the full prose stays one click
+                   * away for anyone who wants the written version.
+                   */}
                   <DocSection index={1} title="Executive summary">
-                    <p className="prose">{selected.executive_summary}</p>
+                    <dl className="summary-lines">
+                      <div>
+                        <dt>Problem</dt>
+                        <dd>{selected.problem_statement || 'Not stated in this document.'}</dd>
+                      </div>
+                      <div>
+                        <dt>Goal</dt>
+                        <dd>{selected.goals_and_objectives?.[0] || 'Not stated in this document.'}</dd>
+                      </div>
+                      <div>
+                        <dt>Expected outcome</dt>
+                        <dd>
+                          {selected.success_metrics_kpis?.[0] ? (
+                            <>
+                              {selected.success_metrics_kpis[0].metric}:{' '}
+                              {selected.success_metrics_kpis[0].baseline || 'not measured'} →{' '}
+                              {selected.success_metrics_kpis[0].target}
+                            </>
+                          ) : (
+                            'No metric defined for this document yet.'
+                          )}
+                        </dd>
+                      </div>
+                    </dl>
+
+                    {selected.executive_summary && (
+                      <details className="doc-summary-full">
+                        <summary>Full executive summary</summary>
+                        <p className="prose">{selected.executive_summary}</p>
+                      </details>
+                    )}
                   </DocSection>
 
                   <DocSection index={2} title="Customer problem and evidence">
@@ -623,6 +757,7 @@ export default function PRDWorkspace() {
                       </div>
                     </DocSection>
                   )}
+                </div>
                 </div>
               )}
             </div>

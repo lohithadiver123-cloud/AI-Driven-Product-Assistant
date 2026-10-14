@@ -1,4 +1,5 @@
 import Icon from '../Icon';
+import ProgressTrail from './ProgressTrail';
 
 /**
  * Page-level layout primitives.
@@ -8,11 +9,17 @@ import Icon from '../Icon';
  * card. Nothing mixes the two.
  */
 
-/** Title, one-line purpose, then actions on the right. */
-export function PageHeader({ title, icon, description, actions, className = '' }) {
+/**
+ * One header for every screen: optional flow trail, title, one line of
+ * purpose, then at most two actions on the right — a filled one that moves the
+ * work forward and an outline one that exports or shares it. A third action
+ * belongs behind the outlined one, not beside it.
+ */
+export function PageHeader({ title, icon, description, trail, actions, className = '' }) {
   return (
     <header className={['page-header', className].filter(Boolean).join(' ')}>
       <div className="page-heading">
+        {trail && <ProgressTrail current={trail} />}
         <h1 className="page-title">
           {icon && (
             <span className="title-icon">

@@ -19,11 +19,8 @@ import {
   Select,
   SkeletonBoard,
   SkeletonTable,
-  Stat,
-  StatGrid,
   Textarea,
   Toolbar,
-  WorkspaceSwitcher,
 } from '../components/ui';
 
 const COLUMNS = [
@@ -67,17 +64,19 @@ export default function UserStoriesWorkspace() {
   const initialPrdId = new URLSearchParams(location.search).get('prd_id') || '';
 
   const { activeId: selectedWorkspace, ready } = useWorkspaces();
-  const [prds, setPrds] = useState([]);
-  const [clusters, setClusters] = useState([]);
+  const [prds, setPrds] = useState(() => (selectedWorkspace ? api.getCached(`/prd/workspace/${selectedWorkspace}`) || [] : []));
+  const [clusters, setClusters] = useState(() => (selectedWorkspace ? api.getCached(`/insights/${selectedWorkspace}/clusters`) || [] : []));
   const [prdFilter, setPrdFilter] = useState(initialPrdId);
-  const [stories, setStories] = useState([]);
+  const [stories, setStories] = useState(() => (selectedWorkspace ? api.getCached(initialPrdId ? `/user-stories/workspace/${selectedWorkspace}?prd_id=${initialPrdId}` : `/user-stories/workspace/${selectedWorkspace}`) || [] : []));
 
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => !selectedWorkspace || !api.getCached(initialPrdId ? `/user-stories/workspace/${selectedWorkspace}?prd_id=${initialPrdId}` : `/user-stories/workspace/${selectedWorkspace}`));
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [query, setQuery] = useState('');
   const [view, setView] = useState('kanban');
   const [expanded, setExpanded] = useState(null);
+  // The story currently being dragged between board columns.
+  const [dragStory, setDragStory] = useState(null);
 
   const [showGenerate, setShowGenerate] = useState(false);
   const [generating, setGenerating] = useState(false);
@@ -91,14 +90,39 @@ export default function UserStoriesWorkspace() {
   const [editing, setEditing] = useState(null);
   const [pendingDelete, setPendingDelete] = useState(null);
 
+  // Sync query params when navigating
+  useEffect(() => {
+    const currentPrdId = new URLSearchParams(location.search).get('prd_id') || '';
+    if (currentPrdId) {
+      setPrdFilter(currentPrdId);
+      setGenPrdId(currentPrdId);
+    }
+  }, [location.search]);
+
+  // Handoff from Copilot or other pages via route state
+  useEffect(() => {
+    if (location.state?.prefill) {
+      const pf = location.state.prefill;
+      if (pf.source) setSource(pf.source);
+      if (pf.prompt) setGenPrompt(pf.prompt);
+      if (pf.prdId) setGenPrdId(pf.prdId);
+      if (pf.clusterId) setGenClusterId(pf.clusterId);
+      if (pf.count) setGenCount(String(pf.count));
+      if (pf.persona) setGenPersona(pf.persona);
+      setShowGenerate(true);
+    }
+  }, [location.state]);
+
   const loadStories = useCallback(async (workspaceId, prdId) => {
     if (!workspaceId) return;
-    setLoading(true);
+    const url = prdId
+      ? `/user-stories/workspace/${workspaceId}?prd_id=${prdId}`
+      : `/user-stories/workspace/${workspaceId}`;
+    if (!api.getCached(url)) {
+      setLoading(true);
+    }
     setError('');
     try {
-      const url = prdId
-        ? `/user-stories/workspace/${workspaceId}?prd_id=${prdId}`
-        : `/user-stories/workspace/${workspaceId}`;
       const { data } = await api.get(url);
       setStories(data);
     } catch {
@@ -283,19 +307,17 @@ export default function UserStoriesWorkspace() {
       <PageHeader
         icon="clipboard"
         title="User stories"
-        description="Sprint-ready stories with Gherkin acceptance criteria, Fibonacci points and T-shirt estimates, tracked on a board."
+        trail="stories"
+        description="Sprint-ready stories with Gherkin acceptance criteria, Fibonacci points and T-shirt estimates."
         actions={
-          <>
-            <WorkspaceSwitcher />
-            <Button
-              variant="primary"
-              icon="sparkle"
-              disabled={!selectedWorkspace}
-              onClick={() => setShowGenerate(true)}
-            >
-              Generate stories
-            </Button>
-          </>
+          <Button
+            variant="primary"
+            icon="sparkle"
+            disabled={!selectedWorkspace}
+            onClick={() => setShowGenerate(true)}
+          >
+            Generate stories
+          </Button>
         }
       />
 
@@ -344,13 +366,8 @@ export default function UserStoriesWorkspace() {
         }
       />
 
-      <StatGrid min={150}>
-        <Stat label="Stories" value={filtered.length} icon="clipboard" featured />
-        <Stat label="Backlog" value={countBy('backlog')} />
-        <Stat label="In progress" value={countBy('in_progress')} />
-        <Stat label="In review" value={countBy('in_review')} />
-        <Stat label="Done" value={countBy('done')} />
-      </StatGrid>
+      {/* No stat cards: the board's own column headers already carry these
+          counts, and the list view shows each story's status on its row. */}
 
       {loading ? (
         view === 'kanban' ? (
@@ -394,27 +411,58 @@ export default function UserStoriesWorkspace() {
           {COLUMNS.map((column) => {
             const columnStories = filtered.filter((s) => (s.status || 'backlog') === column.id);
             return (
-              <section key={column.id} className="kanban-column" aria-label={column.label}>
+              <section
+                key={column.id}
+                className={`kanban-column${dragStory ? ' is-drop-target' : ''}`}
+                aria-label={column.label}
+                onDragOver={(event) => event.preventDefault()}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  if (dragStory) changeStatus(dragStory.id, column.id);
+                  setDragStory(null);
+                }}
+              >
                 <header className={`kanban-col-header tone-${column.tone}`}>
                   <span className="col-label">{column.label}</span>
                   <span className="badge-num">{columnStories.length}</span>
                 </header>
 
                 <div className="kanban-cards-container">
+                  {/*
+                   * An empty column is a target, not a dead end: it keeps a
+                   * dashed drop zone so there is somewhere obvious to drag to.
+                   */}
                   {columnStories.length === 0 && (
-                    <p className="text-xs text-light" style={{ padding: 'var(--sp-2)' }}>
-                      Nothing here
-                    </p>
+                    <div className="kanban-dropzone">
+                      <Icon name="plus" size={14} />
+                      <span>Drop a story here</span>
+                    </div>
                   )}
 
                   {columnStories.map((story) => {
                     const isOpen = expanded === story.id;
+                    const scenarios = story.acceptance_criteria?.length || 0;
                     return (
-                      <article key={story.id} className="story-card">
+                      <article
+                        key={story.id}
+                        className="story-card"
+                        draggable
+                        onDragStart={() => setDragStory(story)}
+                        onDragEnd={() => setDragStory(null)}
+                      >
+                        {/*
+                         * Collapsed by default: title, points and priority are
+                         * what a board is scanned for. The statement and the
+                         * Gherkin scenarios are one click away, and the status
+                         * moved out of the card entirely — dragging between
+                         * columns is the way to change it.
+                         */}
                         <div className="story-top-row">
                           <div className="story-points-group">
                             <span className="badge badge-accent">{story.story_points || 3} pts</span>
-                            <span className="badge badge-neutral">{story.t_shirt_size || 'M'}</span>
+                            <span className="badge badge-neutral" title={`T-shirt size ${story.t_shirt_size || 'M'}`}>
+                              {story.t_shirt_size || 'M'}
+                            </span>
                           </div>
                           <Badge tone={PRIORITY_TONE[(story.priority || 'medium').toLowerCase()] || 'neutral'}>
                             {story.priority || 'medium'}
@@ -423,25 +471,27 @@ export default function UserStoriesWorkspace() {
 
                         <h3 className="story-title">{story.title}</h3>
 
-                        <p className="story-statement">
-                          <strong>As a</strong> <span className="highlight-role">{story.role}</span>,{' '}
-                          <strong>I want to</strong> {story.action}, <strong>so that</strong> {story.benefit}.
-                        </p>
+                        <div className="story-card-footer">
+                          <button
+                            type="button"
+                            className="btn-toggle-criteria"
+                            aria-expanded={isOpen}
+                            onClick={() => setExpanded(isOpen ? null : story.id)}
+                          >
+                            <Icon name={isOpen ? 'chevronDown' : 'chevronRight'} size={12} />
+                            {isOpen ? 'Hide story' : `Story${scenarios ? ` · ${scenarios} scenarios` : ''}`}
+                          </button>
+                          {renderStoryActions(story)}
+                        </div>
 
-                        {story.acceptance_criteria?.length > 0 && (
-                          <div className="acceptance-criteria-section">
-                            <button
-                              type="button"
-                              className="btn-toggle-criteria"
-                              aria-expanded={isOpen}
-                              onClick={() => setExpanded(isOpen ? null : story.id)}
-                            >
-                              <Icon name={isOpen ? 'chevronDown' : 'chevronRight'} size={12} />{' '}
-                              {story.acceptance_criteria.length} acceptance{' '}
-                              {story.acceptance_criteria.length === 1 ? 'scenario' : 'scenarios'}
-                            </button>
+                        {isOpen && (
+                          <div className="stack stack-sm story-detail">
+                            <p className="story-statement">
+                              <strong>As a</strong> <span className="highlight-role">{story.role}</span>,{' '}
+                              <strong>I want to</strong> {story.action}, <strong>so that</strong> {story.benefit}.
+                            </p>
 
-                            {isOpen && (
+                            {story.acceptance_criteria?.length > 0 && (
                               <div className="criteria-dropdown">
                                 {story.acceptance_criteria.map((criteria) => (
                                   <div key={criteria.scenario} className="gherkin-scenario">
@@ -461,11 +511,6 @@ export default function UserStoriesWorkspace() {
                             )}
                           </div>
                         )}
-
-                        <div className="story-card-footer">
-                          {statusSelect(story)}
-                          {renderStoryActions(story)}
-                        </div>
                       </article>
                     );
                   })}

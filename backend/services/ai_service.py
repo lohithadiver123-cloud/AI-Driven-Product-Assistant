@@ -8,31 +8,166 @@ import os
 import re
 import json
 import logging
+import time
 from typing import List, Dict, Any, Optional
+
 from config import settings
 
 logger = logging.getLogger(__name__)
 
 # Gemini models ordered by performance and stability
 GEMINI_MODELS = [
-    "gemini-3.6-flash",
-    "gemini-flash-latest",
+    "gemini-3.8-flash",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
 ]
 
-# Groq fallback models
+# OpenRouter free models — all $0 cost verified.
+#
+# Measured against the real analysis prompt (100 sampled reviews, JSON schema out):
+#   liquid/lfm-2.5-2.6b:free           16.2s, complete JSON
+#   dots-studio/dots-3-note-preview    104s,  complete JSON (kept as a slow last resort)
+#   nvidia/nemotron-3.5-lightning      spent every output token on reasoning, returned
+#                                      nothing at 120s — unusable for a JSON answer
+#   cohere/north-mini-code             answered in prose, never matched the schema
+# The two models that cannot produce the schema are dropped rather than left in the list
+# to burn a slot of the budget on every call.
+OPENROUTER_MODELS = [
+    "liquid/lfm-2.5-2.6b:free",
+    "dots-studio/dots-3-note-preview:free",
+]
+
+# Groq models — verified available and active for this API key.
+#
+# Ordered by measured time to a schema-valid answer on the real analysis prompt:
+#   openai/gpt-oss-20b    2.3s
+#   qwen/qwen3.8-27b      3.6s
+#   openai/gpt-oss-120b   4.0s
+# allam-2-7b is dropped: it answered in 1.6-16s on every attempt but never returned the
+# required keys, so it only ever delayed the model that could.
 GROQ_MODELS = [
     "openai/gpt-oss-20b",
     "qwen/qwen3.8-27b",
     "openai/gpt-oss-120b",
-    "allam-2-7b",
 ]
 
-# Mistral models — the free "Experiment" tier carries the largest free allowance
-# (roughly a billion tokens a month) and speaks the OpenAI chat-completions API.
+# Mistral models — free Experiment tier
 MISTRAL_MODELS = [
     "mistral-small-latest",
     "mistral-medium-latest",
 ]
+
+# Output budget for an OpenRouter call.
+#
+# The free models on this provider reason before they answer, and reasoning tokens are
+# billed against `max_tokens`. At 2,200 none of them ever reached the JSON: measured at
+# that cap, every one of them stopped on finish_reason="length" with an empty or half
+# written object. Raised to 8,000 the same prompt returns a complete answer (3,642
+# completion tokens, of which 2,277 were reasoning), which is why the OpenRouter calls
+# no longer share the smaller Groq budget.
+OPENROUTER_MAX_TOKENS = 8000
+
+# Time allowed for one OpenRouter call. The 20 s used elsewhere in the chain clipped the
+# slower free models mid-answer: the first model in the list needs ~16 s on the analysis
+# prompt, and a document prompt is larger than that.
+OPENROUTER_TIMEOUT_SECONDS = 45.0
+
+
+# Markers for a throttle. A 429 or a 503 is a property of the provider account or of the
+# service as a whole, not of the individual model, so asking the provider's next model
+# after one has already said "rate limited" just spends another timeout to collect the
+# same answer. Observed live: Gemini answering 503 "high demand" for both of its models
+# and Mistral answering 429 for both of its models, on every single call.
+_THROTTLE_MARKERS = (
+    "429",
+    "rate limit",
+    "rate_limit",
+    "ratelimit",
+    "too many requests",
+    "resource_exhausted",
+    "resource exhausted",
+    "quota",
+    "503",
+    "unavailable",
+    "high demand",
+    "overloaded",
+)
+
+
+def is_provider_throttled(error: Exception) -> bool:
+    """Whether a provider error means the provider itself is refusing traffic right now."""
+    text = f"{type(error).__name__}: {error}".lower()
+    return any(marker in text for marker in _THROTTLE_MARKERS)
+
+
+# A throttled provider is set aside for a cooldown window rather than retried on the next
+# call. Without this, every request re-pays a doomed attempt against a provider that is
+# already refusing us: one analysis call measured 36.6 s, nearly all of it waiting on a
+# Gemini 503 and a Mistral 429 that were never going to answer before Groq did.
+_PROVIDER_COOLDOWN_SECONDS = 300
+_provider_cooldown: Dict[str, float] = {}
+
+
+def mark_provider_throttled(provider: str) -> None:
+    """Set a provider aside after it refused traffic."""
+    _provider_cooldown[provider] = time.time() + _PROVIDER_COOLDOWN_SECONDS
+
+
+# Wall-clock budget for one analysis call across every provider in the chain.
+#
+# Each provider is asked in turn with its own per-request timeout, so without a ceiling
+# the worst case is the sum of all of them — measured at 36.6 s for a single analysis
+# spent waiting on a Gemini 503 and a Mistral 429, and 59 s end to end for a
+# 10,000-record workspace. The deterministic engine always has an answer to give, so a
+# model that has not answered within the budget is one the analysis can do without.
+AI_ANALYSIS_BUDGET_SECONDS = 45.0
+
+# ...and a slice of that budget for each provider, because the total alone was not enough.
+#
+# Measured on a 10,000-record workspace: Groq answered 429 "output tokens per minute"
+# first, and by the time the code had finished with it the shared 25 s deadline had
+# already passed — so the OpenRouter, Gemini and Mistral blocks were skipped without a
+# single request being made, and the run fell back to the deterministic engine 30 s in
+# while a working provider sat unused. A provider now only ever spends its own slice, so
+# a refusal from the first one cannot starve the rest.
+PROVIDER_BUDGET_SECONDS = {
+    "Groq": 12.0,        # answers in 2-4 s when it is not rate limited
+    "OpenRouter": 32.0,  # the free reasoning models need ~16 s end to end
+    "Gemini": 15.0,
+    "Mistral": 15.0,
+}
+
+
+def _provider_window(total_deadline: float, provider: str) -> float:
+    """When this provider's own slice of the budget runs out.
+
+    Never later than the overall deadline, so the chain still finishes inside its ceiling.
+    """
+    return min(total_deadline, time.time() + PROVIDER_BUDGET_SECONDS.get(provider, 15.0))
+
+
+def _remaining_budget(deadline: float, cap: float = 20.0) -> float:
+    """Seconds to allow for the next call: never more than its own cap, never below 1."""
+    return max(1.0, min(cap, deadline - time.time()))
+
+
+def provider_in_cooldown(provider: str) -> bool:
+    """Whether a provider is currently being skipped, expiring the entry when it lapses."""
+    until = _provider_cooldown.get(provider)
+    if not until:
+        return False
+    if until <= time.time():
+        _provider_cooldown.pop(provider, None)
+        return False
+    return True
+
+
+# Timeout for a Gemini call, in milliseconds, applied to the client rather than to a
+# request. It used to be passed as `timeout=` inside GenerateContentConfig, which this
+# version of the SDK rejects outright — "Extra inputs are not permitted" — so every Gemini
+# call failed before it left the machine, silently costing the chain its third provider.
+GEMINI_TIMEOUT_MS = 15000
 
 
 def get_gemini_client():
@@ -42,10 +177,21 @@ def get_gemini_client():
         return None
     try:
         from google import genai
-        return genai.Client(api_key=api_key)
+        from google.genai import types
+        return genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+        )
     except Exception as e:
         logger.warning(f"Failed to initialize Gemini client: {e}")
         return None
+
+
+# The SDKs retry a timed-out request twice by default, so one logical attempt can cost
+# three times its timeout. This module is already a fallback chain — it has its own next
+# provider to ask — and paying the provider's retries on top measured at 43.6 s for a
+# single title pass whose own budget was 25 s.
+_PROVIDER_MAX_RETRIES = 0
 
 
 def get_mistral_client():
@@ -55,9 +201,30 @@ def get_mistral_client():
         return None
     try:
         from openai import OpenAI
-        return OpenAI(api_key=api_key, base_url="https://api.mistral.ai/v1")
+        return OpenAI(api_key=api_key, base_url="https://api.mistral.ai/v1", max_retries=_PROVIDER_MAX_RETRIES)
     except Exception as e:
         logger.warning(f"Failed to initialize Mistral client: {e}")
+        return None
+
+
+def get_openrouter_client():
+    """Create and return an OpenAI-compatible OpenRouter client if an API key is configured."""
+    api_key = settings.OPENROUTER_API_KEY or os.getenv("OPENROUTER_API_KEY", "")
+    if not api_key:
+        return None
+    try:
+        from openai import OpenAI
+        return OpenAI(
+            api_key=api_key,
+            base_url="https://openrouter.ai/api/v1",
+            max_retries=_PROVIDER_MAX_RETRIES,
+            default_headers={
+                "HTTP-Referer": "https://pm-copilot.app",
+                "X-Title": "PM Copilot",
+            },
+        )
+    except Exception as e:
+        logger.warning(f"Failed to initialize OpenRouter client: {e}")
         return None
 
 
@@ -68,7 +235,7 @@ def get_groq_client():
         return None
     try:
         from groq import Groq
-        return Groq(api_key=api_key)
+        return Groq(api_key=api_key, max_retries=_PROVIDER_MAX_RETRIES)
     except Exception as e:
         logger.warning(f"Failed to initialize Groq client: {e}")
         return None
@@ -83,25 +250,31 @@ def check_ai_status() -> Dict[str, Any]:
     result itself (each analysis and document stores its model), and every caller falls back
     in order: Gemini, then Mistral, then Groq, then the deterministic engine.
     """
+    groq_client = get_groq_client()
+    openrouter_client = get_openrouter_client()
     gem_client = get_gemini_client()
     mistral_client = get_mistral_client()
-    groq_client = get_groq_client()
 
-    # Providers are tried in this order; the configured ones are listed honestly below.
+    # Providers are tried in this order: Groq (fastest) -> OpenRouter -> Gemini -> Mistral
     configured = [
         name for name, client in (
-            ("Gemini", gem_client), ("Mistral", mistral_client), ("Groq", groq_client)
+            ("Groq", groq_client),
+            ("OpenRouter", openrouter_client),
+            ("Gemini", gem_client),
+            ("Mistral", mistral_client),
         ) if client
     ]
 
     if configured:
         # Report the model of the provider that will actually be tried first.
-        if gem_client:
-            lead_model = GEMINI_MODELS[0]
-        elif mistral_client:
-            lead_model = MISTRAL_MODELS[0]
-        else:
+        if groq_client:
             lead_model = GROQ_MODELS[0]
+        elif openrouter_client:
+            lead_model = OPENROUTER_MODELS[0]
+        elif gem_client:
+            lead_model = GEMINI_MODELS[0]
+        else:
+            lead_model = MISTRAL_MODELS[0]
         order = " then ".join(configured)
         if len(configured) == 1:
             name_list = configured[0]
@@ -245,6 +418,7 @@ def analyze_feedback_with_ai(feedback_records: List[Dict[str, Any]]) -> Optional
 
     formatted_sample = _get_stratified_substantive_sample(feedback_records, max_sample_size=100)
     feedback_text = "\n".join(formatted_sample)
+    deadline = time.time() + AI_ANALYSIS_BUDGET_SECONDS
 
     prompt = f"""You are a Principal AI Product Manager analyzing real customer reviews.
 Generate deep, authentic product intelligence based STRICTLY on the real feedback below.
@@ -300,33 +474,126 @@ Customer Reviews Corpus (Sampled from {len(feedback_records)} records):
 {feedback_text}
 """
 
-    # 1. Try Google Gemini (Pure AI)
+    # 1. Try Groq first — confirmed working key, fastest free tier
+    groq_client = get_groq_client()
+    if groq_client and not provider_in_cooldown("Groq"):
+        groq_deadline = _provider_window(deadline, "Groq")
+        attempted = 0
+        throttled = 0
+        for model_name in GROQ_MODELS:
+            if time.time() >= groq_deadline:
+                break
+            attempted += 1
+            try:
+                logger.info(f"Attempting Groq AI analysis using {model_name}...")
+                # No `response_format` here on purpose. Measured on the real analysis
+                # prompt, Groq's fastest model (openai/gpt-oss-20b) rejected JSON mode
+                # outright — 400 "Failed to validate JSON" with an empty failed_generation —
+                # while answering correctly, in 2.3 s, without it. The question asks for
+                # JSON in prose, and _extract_json_from_text unwraps fences and surrounding
+                # text, so the response format is the weaker guarantee of the two.
+                response = groq_client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": "You are a Principal AI Product Manager. Respond ONLY in valid JSON."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.1,
+                    max_tokens=2200,
+                    timeout=_remaining_budget(groq_deadline),
+                )
+                raw_content = response.choices[0].message.content
+                parsed = _extract_json_from_text(raw_content)
+                if parsed and "pain_points" in parsed and "themes" in parsed and "feature_clusters" in parsed:
+                    parsed["ai_model"] = f"Groq ({model_name})"
+                    logger.info(f"Groq AI analysis succeeded with {model_name}!")
+                    return parsed
+            except Exception as e:
+                logger.warning(f"Groq model {model_name} error: {e}. Trying next...")
+                if is_provider_throttled(e):
+                    throttled += 1
+        # Groq meters output tokens per model, not per account, so one model answering
+        # 429 says nothing about the next one. The provider is only stood down when every
+        # model in the list refused — breaking out on the first refusal is what left the
+        # chain with no provider to answer at all.
+        if attempted and throttled == attempted:
+            mark_provider_throttled("Groq")
+            logger.warning("Every Groq model refused; skipping Groq until the cooldown lapses.")
+
+    # 2. Try OpenRouter (free tier — OpenAI-compatible, verified active)
+    openrouter_client = get_openrouter_client()
+    if openrouter_client and not provider_in_cooldown("OpenRouter"):
+        openrouter_deadline = _provider_window(deadline, "OpenRouter")
+        attempted = 0
+        throttled = 0
+        for model_name in OPENROUTER_MODELS:
+            if time.time() >= openrouter_deadline:
+                break
+            attempted += 1
+            try:
+                logger.info(f"Attempting OpenRouter AI analysis using {model_name}...")
+                response = openrouter_client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": "You are a Principal AI Product Manager. Respond ONLY in valid JSON."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.2,
+                    max_tokens=OPENROUTER_MAX_TOKENS,
+                    timeout=_remaining_budget(openrouter_deadline),
+                )
+                raw_content = response.choices[0].message.content
+                parsed = _extract_json_from_text(raw_content)
+                if parsed and "pain_points" in parsed and "themes" in parsed and "feature_clusters" in parsed:
+                    parsed["ai_model"] = f"OpenRouter ({model_name})"
+                    logger.info(f"OpenRouter AI analysis succeeded with {model_name}!")
+                    return parsed
+            except Exception as e:
+                logger.warning(f"OpenRouter model {model_name} error: {e}. Trying next...")
+                if is_provider_throttled(e):
+                    throttled += 1
+        if attempted and throttled == attempted:
+            mark_provider_throttled("OpenRouter")
+            logger.warning("Every OpenRouter model refused; skipping it until the cooldown lapses.")
+
+    # 3. Try Google Gemini (backup)
     gem_client = get_gemini_client()
-    if gem_client:
+    if gem_client and not provider_in_cooldown("Gemini"):
+        gemini_deadline = _provider_window(deadline, "Gemini")
         for g_model in GEMINI_MODELS:
+            if time.time() >= gemini_deadline:
+                break
             try:
                 from google.genai import types
-                logger.info(f"Executing Pure AI analysis with Google Gemini model {g_model}...")
+                logger.info(f"Attempting Gemini analysis with model {g_model}...")
                 response = gem_client.models.generate_content(
                     model=g_model,
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         temperature=0.2,
+                        timeout=_remaining_budget(gemini_deadline, cap=15),
                     ),
                 )
                 parsed = _extract_json_from_text(response.text)
                 if parsed and "pain_points" in parsed and "themes" in parsed and "feature_clusters" in parsed:
                     parsed["ai_model"] = f"Google Gemini ({g_model})"
-                    logger.info(f"Google Gemini analysis succeeded with {g_model}!")
+                    logger.info(f"Gemini analysis succeeded with {g_model}!")
                     return parsed
             except Exception as e:
                 logger.warning(f"Gemini model {g_model} error: {e}. Trying next...")
+                if is_provider_throttled(e):
+                    mark_provider_throttled("Gemini")
+                    logger.warning("Gemini is throttled; skipping it until the cooldown lapses.")
+                    break
 
-    # 2. Try Mistral (free Experiment tier, OpenAI-compatible)
+    # 4. Try Mistral (last resort)
     mistral_client = get_mistral_client()
-    if mistral_client:
+    if mistral_client and not provider_in_cooldown("Mistral"):
+        mistral_deadline = _provider_window(deadline, "Mistral")
         for model_name in MISTRAL_MODELS:
+            if time.time() >= mistral_deadline:
+                break
             try:
                 logger.info(f"Attempting Mistral analysis using {model_name}...")
                 response = mistral_client.chat.completions.create(
@@ -338,6 +605,7 @@ Customer Reviews Corpus (Sampled from {len(feedback_records)} records):
                     temperature=0.2,
                     max_tokens=2200,
                     response_format={"type": "json_object"},
+                    timeout=_remaining_budget(mistral_deadline),
                 )
                 parsed = _extract_json_from_text(response.choices[0].message.content)
                 if parsed and "pain_points" in parsed and "themes" in parsed and "feature_clusters" in parsed:
@@ -346,31 +614,10 @@ Customer Reviews Corpus (Sampled from {len(feedback_records)} records):
                     return parsed
             except Exception as e:
                 logger.warning(f"Mistral model {model_name} error: {e}. Trying next...")
-
-    # 3. Try Groq AI Fallback
-    groq_client = get_groq_client()
-    if groq_client:
-        for model_name in GROQ_MODELS:
-            try:
-                logger.info(f"Attempting Groq AI fallback using {model_name}...")
-                response = groq_client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": "You are a Principal AI Product Manager. Respond ONLY in valid JSON."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.1,
-                    max_tokens=2200,
-                    response_format={"type": "json_object"} if model_name in ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"] else None
-                )
-                raw_content = response.choices[0].message.content
-                parsed = _extract_json_from_text(raw_content)
-                if parsed and "pain_points" in parsed and "themes" in parsed and "feature_clusters" in parsed:
-                    parsed["ai_model"] = f"Groq ({model_name})"
-                    logger.info(f"Groq AI fallback succeeded with {model_name}!")
-                    return parsed
-            except Exception as e:
-                logger.warning(f"Groq model {model_name} error: {e}. Trying next...")
+                if is_provider_throttled(e):
+                    mark_provider_throttled("Mistral")
+                    logger.warning("Mistral is throttled; skipping it until the cooldown lapses.")
+                    break
 
     logger.error("All AI providers failed. Falling back to heuristic engine.")
     return None

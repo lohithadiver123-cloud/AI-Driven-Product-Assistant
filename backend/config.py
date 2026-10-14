@@ -24,11 +24,15 @@ class Settings:
 
     # AI / Gemini configuration (Milestone 2 & 3 Pure AI)
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+    # AI / OpenRouter configuration (free tier — OpenAI-compatible)
+    OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
+    OPENROUTER_MODEL: str = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-exp:free")
 
     # AI / Groq configuration (Milestone 2)
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
-    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "allam-2-7b")
+    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
     # AI / Mistral configuration (free Experiment tier, OpenAI-compatible API)
     MISTRAL_API_KEY: str = os.getenv("MISTRAL_API_KEY", "")

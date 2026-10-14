@@ -117,6 +117,10 @@ class ImportResultResponse(BaseModel):
     successful: int
     failed: int
     status: str
+    analysis_queued: bool = Field(
+        False,
+        description="Whether an AI analysis of the imported records was started in the background",
+    )
 
 
 class BulkActionResponse(BaseModel):
